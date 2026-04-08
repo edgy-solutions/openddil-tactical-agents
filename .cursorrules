@@ -1,0 +1,16 @@
+# Cursor Rules for OpenDDIL Tactical Agents
+
+- **Context**: Phases 7.2 and 7.3 of the OpenDDIL project. This is a Regional Hub component for autonomous processing, UI projection, and stateful detection.
+- **Frameworks**: 
+  - Use `faust-streaming` for high-speed Kafka stream processing.
+  - Use `restate-sdk` for long-running, durable stateful workflows.
+- **Data Format**: Output messages to Kafka MUST be CloudEvents JSON envelopes.
+- **Database**: 
+  - Use `asyncpg` for PostgreSQL interactions.
+  - Target the Regional database (`regional_db`), NOT HQ.
+  - All INSERTs must be idempotent (`ON CONFLICT DO NOTHING`).
+- **Architecture**: 
+  - Strict CQRS pattern. The projector only writes to the read model table (`local_tactical_alerts`).
+  - No external HTTP webhooks are allowed in the projector.
+  - Use Restate's `ctx.sleep()` for durable timers and `ctx.run()` for side-effects (e.g., publishing to Kafka).
+- **Python Style**: Standard PEP 8, robust error handling, and `logging` are required.

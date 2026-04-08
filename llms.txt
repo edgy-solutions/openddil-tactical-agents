@@ -1,0 +1,21 @@
+# OpenDDIL Tactical Agents - LLM Context
+
+This repository (`openddil-tactical-agents`) covers Phases 7.2 and 7.3 of the OpenDDIL architecture.
+
+## Purpose
+1. Run autonomous pattern detection on sensor data at the Regional Hub (Faust).
+2. Provide a local read projector for offline UI capabilities (CQRS) (Faust).
+3. Handle complex, long-running stateful workflows that survive DDIL network drops (Restate).
+
+## Key Files
+- `faust_agents.py`: The main Faust application containing two agents:
+  1. **Tumbling Window Agent**: Reads `raw-sensor-stream`, calculates 10-second tumbling window averages by `device_id`, and publishes `openddil.tactical.ThresholdExceeded` CloudEvents to `tactical-events` if thresholds are breached.
+  2. **UI Read Projector**: Reads `tactical-events` and idempotently inserts alerts into the Regional PostgreSQL `local_tactical_alerts` table using `asyncpg`.
+- `restate_agents.py`: The Restate application containing:
+  1. **SensorStateMonitor**: A Virtual Object keyed by `device_id`. Handles `Connection_Lost` events by sleeping durably for 45s. If no `Connection_Restored` event is received, it publishes a `DeviceOfflineAlert` to `tactical-events`.
+
+## Rules
+- **Frameworks**: Use `faust-streaming` for high-speed stream processing. Use `restate-sdk` for durable stateful workflows.
+- **Data Format**: All output events must be CloudEvents.
+- **Database**: Use `asyncpg`. Writes go to the Regional DB, not HQ. Writes must be idempotent.
+- **No Webhooks**: The projector must not use external HTTP calls.
