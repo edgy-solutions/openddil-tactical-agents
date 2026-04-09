@@ -13,8 +13,10 @@ ENV PATH="/opt/venv/bin:$PATH"
 
 # Install Python dependencies into a dedicated virtual environment
 # Assuming build context is the repository root
+WORKDIR /app
 COPY pyproject.toml .
-RUN uv pip install --no-cache .
+RUN uv pip compile pyproject.toml -o requirements.txt && \
+    uv pip install --no-cache -r requirements.txt
 
 # Stage 2: Debug (Optional, but highly recommended for testing)
 # Add comments indicating this stage is for development and troubleshooting only and must not be deployed to production.
