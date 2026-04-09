@@ -4,6 +4,8 @@ import logging
 import asyncpg
 import restate
 from restate.context import Context
+import cloud_event_pb2
+import tactical_events_pb2
 
 logging.basicConfig(
     level=logging.INFO,
@@ -60,13 +62,19 @@ async def insert_to_db(payload: dict) -> bool:
 HubUIProjector = restate.Service("HubUIProjector")
 
 @HubUIProjector.handler()
-async def project_alert(ctx: Context, cloudevent: dict):
+async def project_alert(ctx: Context, cloudevent_bytes: bytes):
     """
     Restate handler designed to process incoming CloudEvents from the 
     global-tactical-events Redpanda topic.
     """
-    event_id = cloudevent.get("id")
-    event_type = cloudevent.get("type")
+    try:
+        ce = cloud_event_pb2.CloudEvent.FromString(cloudevent_bytes)
+    except Exception as e:
+        logger.error(f"Failed to deserialize CloudEvent: {e}")
+        return
+
+    event_id = ce.id
+    event_type = ce.type
     
     # We only care about tactical alerts (ThresholdExceeded, DeviceOfflineAlert, etc.)
     if not event_type or not event_type.startswith("openddil.tactical."):
@@ -75,12 +83,28 @@ async def project_alert(ctx: Context, cloudevent: dict):
 
     logger.info(f"Processing tactical alert {event_id} of type {event_type}")
 
+    severity = 'UNKNOWN'
+    if event_type == "openddil.tactical.ThresholdExceeded":
+        tactical_event = tactical_events_pb2.ThresholdExceededEvent()
+        ce.data.Unpack(tactical_event)
+        severity = tactical_event.severity
+
+    payload = {
+        'id': ce.id,
+        'source': ce.source,
+        'type': ce.type,
+        'time': ce.time,
+        'data': {
+            'severity': severity
+        }
+    }
+
     # Use a Restate side-effect to execute the database transaction.
     # NOTE: ctx.run ensures exactly-once UI alerts even if Postgres temporarily disconnects.
     # If the database is down, the side-effect will fail, and Restate will automatically
     # and durably retry the execution of this specific side-effect until it succeeds,
     # without re-running any prior logic.
-    await ctx.run("insert_alert", insert_to_db, cloudevent)
+    await ctx.run("insert_alert", insert_to_db, payload)
     
     return {"status": "projected", "id": event_id}
 

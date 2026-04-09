@@ -10,6 +10,20 @@ from typing import Dict, Any
 # Add parent directory to path to import config
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import config
+import cloud_event_pb2
+import tactical_events_pb2
+from faust.serializers import codecs as faust_codecs
+
+class CloudEventProtobufSerializer(faust_codecs.Codec):
+    def _dumps(self, obj) -> bytes:
+        return obj.SerializeToString()
+    
+    def _loads(self, s: bytes):
+        ce = cloud_event_pb2.CloudEvent()
+        ce.ParseFromString(s)
+        return ce
+
+faust_codecs.register('protobuf', CloudEventProtobufSerializer())
 
 logging.basicConfig(
     level=logging.INFO,
@@ -23,12 +37,12 @@ settings = config.load_config(os.path.join(os.path.dirname(os.path.dirname(os.pa
 app = faust.App(
     'edge-faust-detector-app',
     broker=f'kafka://{settings.kafka.brokers}',
-    value_serializer='json',
+    value_serializer='protobuf',
 )
 
 # Define topics
-raw_sensor_topic = app.topic(settings.kafka.raw_topic, value_type=dict)
-tactical_events_topic = app.topic(settings.kafka.tactical_topic, value_type=dict)
+raw_sensor_topic = app.topic(settings.kafka.raw_topic, value_type=cloud_event_pb2.CloudEvent)
+tactical_events_topic = app.topic(settings.kafka.tactical_topic, value_type=cloud_event_pb2.CloudEvent)
 
 # Determine default tumbling window from config
 faust_sensors = [s for s in settings.sensors if s.processing.engine == 'faust']
@@ -40,16 +54,16 @@ sensor_stats_table = app.Table(
     default=lambda: {'sum': 0.0, 'count': 0},
 ).tumbling(default_window, expires=datetime.timedelta(seconds=default_window))
 
-def create_cloudevent(device_id: str, event_type: str, data: dict) -> dict:
-    """Constructs a standard CloudEvents JSON envelope."""
-    return {
-        "id": str(uuid.uuid4()),
-        "source": str(device_id),
-        "type": event_type,
-        "time": datetime.datetime.utcnow().isoformat() + "Z",
-        "datacontenttype": "application/json",
-        "data": data
-    }
+def create_cloudevent(device_id: str, event_type: str, data_pb) -> cloud_event_pb2.CloudEvent:
+    """Constructs a standard CloudEvents Protobuf envelope."""
+    ce = cloud_event_pb2.CloudEvent()
+    ce.id = str(uuid.uuid4())
+    ce.source = str(device_id)
+    ce.type = event_type
+    ce.time = datetime.datetime.utcnow().isoformat() + "Z"
+    ce.datacontenttype = "application/protobuf"
+    ce.data.Pack(data_pb)
+    return ce
 
 @app.agent(raw_sensor_topic)
 async def process_sensor_data(stream):
@@ -60,8 +74,8 @@ async def process_sensor_data(stream):
     If threshold is exceeded, publishes to tactical-events.
     """
     # Group the stream by device_id (source in CloudEvents)
-    async for event in stream.group_by(lambda x: x.get('source')):
-        event_type = event.get('type', '')
+    async for event in stream.group_by(lambda x: x.source):
+        event_type = event.type
         
         # Dynamically pull config based on CloudEvent type
         sensor_config = next((s for s in settings.sensors if s.cloudevent_type == event_type), None)
@@ -72,11 +86,20 @@ async def process_sensor_data(stream):
             
         critical_threshold = sensor_config.processing.critical_threshold
             
-        device_id = event.get('source')
+        device_id = event.source
         if not device_id:
             continue
             
-        data = event.get('data', {})
+        try:
+            # Assuming event.data is an Any containing JSON bytes
+            data = json.loads(event.data.value.decode('utf-8'))
+        except Exception:
+            try:
+                # Fallback if it's just bytes
+                data = json.loads(event.data.decode('utf-8'))
+            except Exception:
+                continue
+                
         # Extract the sensor reading
         reading = data.get('temperature') or data.get('value')
         
@@ -100,12 +123,12 @@ async def process_sensor_data(stream):
         if avg_reading > critical_threshold:
             logger.warning(f"Anomaly detected for {device_id}! Avg: {avg_reading:.2f} > {critical_threshold}")
             
-            alert_data = {
-                "device_id": device_id,
-                "average_reading": avg_reading,
-                "threshold": critical_threshold,
-                "severity": "HIGH"
-            }
+            # Construct ThresholdExceededEvent protobuf
+            alert_data = tactical_events_pb2.ThresholdExceededEvent()
+            alert_data.device_id = device_id
+            alert_data.average_reading = avg_reading
+            alert_data.threshold = critical_threshold
+            alert_data.severity = "HIGH"
             
             # Construct CloudEvents envelope
             alert_event = create_cloudevent(
@@ -115,7 +138,7 @@ async def process_sensor_data(stream):
             )
             
             # Publish to tactical-events topic
-            await tactical_events_topic.send(key=device_id, value=alert_event)
+            await tactical_events_topic.send(key=device_id.encode('utf-8'), value=alert_event)
 
 if __name__ == '__main__':
     app.main()
