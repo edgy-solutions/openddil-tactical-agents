@@ -1,0 +1,62 @@
+name: Docker Build
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  build-edge-faust:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+
+      - name: Build edge-faust-detector
+        uses: docker/build-push-action@v4
+        with:
+          context: .
+          file: ./edge/faust/Dockerfile
+          push: false # Set to true and configure login step to push to registry
+          tags: openddil/edge-faust-detector:latest
+          target: production
+
+  build-edge-restate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+
+      - name: Build edge-restate-detector
+        uses: docker/build-push-action@v4
+        with:
+          context: .
+          file: ./edge/restate/Dockerfile
+          push: true
+          tags: openddil/edge-restate-detector:latest
+          target: production
+
+  build-hub-projector:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+
+      - name: Build hub-restate-projector
+        uses: docker/build-push-action@v4
+        with:
+          context: .
+          file: ./hub/projector/Dockerfile
+          push: true
+          tags: openddil/hub-restate-projector:latest
+          target: production
