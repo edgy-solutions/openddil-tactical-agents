@@ -2,7 +2,7 @@
 
 This repository contains the autonomous agents that detect patterns in the `raw-sensor-stream` while disconnected from Central Command. 
 
-**DO NOT add external database writes (MongoDB) or HTTP Webhooks (Alertmanager) to these agents.** They must output exclusively to the `tactical-events` Redpanda topic to maintain DDIL resilience.
+**DO NOT add external database writes or HTTP Webhooks to these agents.** They must output exclusively to the `tactical-events` Redpanda topic to maintain DDIL resilience.
 
 ## Agent Architecture
 
