@@ -10,7 +10,7 @@
   - Target the Regional database (`regional_db`), NOT HQ.
   - All INSERTs must be idempotent (`ON CONFLICT DO NOTHING`).
 - **Architecture**: 
-  - Strict CQRS pattern. The projector only writes to the read model table (`local_tactical_alerts`).
+  - Strict CQRS pattern. The projector (`hub_restate_projector.py`) only writes to the read model table (`local_tactical_alerts`).
   - No external HTTP webhooks are allowed in the projector.
-  - Use Restate's `ctx.sleep()` for durable timers and `ctx.run()` for side-effects (e.g., publishing to Kafka).
+  - Use Restate's `ctx.sleep()` for durable timers and `ctx.run()` for side-effects (e.g., publishing to Kafka, inserting to DB).
 - **Python Style**: Standard PEP 8, robust error handling, and `logging` are required.

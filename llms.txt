@@ -12,6 +12,8 @@ This repository (`openddil-tactical-agents`) covers Phases 7.2 and 7.3 of the Op
   1. **Tumbling Window Agent**: Reads `raw-sensor-stream`, calculates 10-second tumbling window averages by `device_id`, and publishes `openddil.tactical.ThresholdExceeded` CloudEvents to `tactical-events` if thresholds are breached.
 - `edge/edge_restate_detector.py`: The Restate application containing:
   1. **SensorStateMonitor**: A Virtual Object keyed by `device_id`. Handles `Connection_Lost` events by sleeping durably for 45s. If no `Connection_Restored` event is received, it publishes a `DeviceOfflineAlert` to `tactical-events`.
+- `hub/hub_restate_projector.py`: The Restate application containing:
+  1. **HubUIProjector**: A Service that idempotently inserts alerts into the Regional PostgreSQL `local_tactical_alerts` table using `asyncpg` within a `ctx.run` side-effect.
 
 ## Rules
 - **Frameworks**: Use `faust-streaming` for high-speed stream processing. Use `restate-sdk` for durable stateful workflows.

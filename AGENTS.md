@@ -11,9 +11,9 @@ You are an AI agent working on the `openddil-tactical-agents` repository. This r
    - State management must use Faust's built-in `Table` capabilities (e.g., tumbling windows).
 
 2. **Restate Durable Execution**:
-   - Used for long-running, stateful workflows in `edge/edge_restate_detector.py`.
-   - Workflows must use Restate Virtual Objects keyed by `device_id`.
-   - Use `ctx.sleep()` for durable timers and `ctx.run()` for side-effects (like publishing to Kafka).
+   - Used for long-running, stateful workflows in `edge/edge_restate_detector.py` and exactly-once projections in `hub/hub_restate_projector.py`.
+   - Workflows must use Restate Virtual Objects keyed by `device_id` or Services for stateless projections.
+   - Use `ctx.sleep()` for durable timers and `ctx.run()` for side-effects (like publishing to Kafka or writing to Postgres).
 
 3. **CloudEvents Standard**:
    - Any new events published to `tactical-events` MUST be wrapped in a valid CloudEvents JSON envelope.
