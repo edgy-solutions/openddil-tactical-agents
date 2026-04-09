@@ -3,7 +3,13 @@ import json
 import uuid
 import datetime
 import logging
+import sys
+import os
 from typing import Dict, Any
+
+# Add parent directory to path to import config
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import config
 
 logging.basicConfig(
     level=logging.INFO,
@@ -11,24 +17,28 @@ logging.basicConfig(
 )
 logger = logging.getLogger("edge-faust-detector")
 
+settings = config.load_config(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "config.yaml"))
+
 # Faust App Initialization
 app = faust.App(
     'edge-faust-detector-app',
-    broker='kafka://localhost:9092',
+    broker=f'kafka://{settings.kafka.brokers}',
     value_serializer='json',
 )
 
 # Define topics
-raw_sensor_topic = app.topic('raw-sensor-stream', value_type=dict)
-tactical_events_topic = app.topic('tactical-events', value_type=dict)
+raw_sensor_topic = app.topic(settings.kafka.raw_topic, value_type=dict)
+tactical_events_topic = app.topic(settings.kafka.tactical_topic, value_type=dict)
 
-# Tumbling window table (10 seconds)
+# Determine default tumbling window from config
+faust_sensors = [s for s in settings.sensors if s.processing.engine == 'faust']
+default_window = float(faust_sensors[0].processing.window_seconds) if faust_sensors else 10.0
+
+# Tumbling window table
 sensor_stats_table = app.Table(
     'sensor_stats',
     default=lambda: {'sum': 0.0, 'count': 0},
-).tumbling(10.0, expires=datetime.timedelta(seconds=10))
-
-CRITICAL_THRESHOLD = 85.0  # Example threshold for anomalies
+).tumbling(default_window, expires=datetime.timedelta(seconds=default_window))
 
 def create_cloudevent(device_id: str, event_type: str, data: dict) -> dict:
     """Constructs a standard CloudEvents JSON envelope."""
@@ -46,16 +56,21 @@ async def process_sensor_data(stream):
     """
     Tumbling Window Agent:
     Reads from raw-sensor-stream, filters for temperature/telemetry events,
-    groups by device_id, calculates a 10-second tumbling window average.
+    groups by device_id, calculates a tumbling window average.
     If threshold is exceeded, publishes to tactical-events.
     """
     # Group the stream by device_id (source in CloudEvents)
     async for event in stream.group_by(lambda x: x.get('source')):
         event_type = event.get('type', '')
         
-        # Filter relevant telemetry events
-        if 'temperature' not in event_type and 'data' not in event_type:
+        # Dynamically pull config based on CloudEvent type
+        sensor_config = next((s for s in settings.sensors if s.cloudevent_type == event_type), None)
+        
+        # Filter relevant telemetry events that should be processed by Faust
+        if not sensor_config or sensor_config.processing.engine != 'faust':
             continue
+            
+        critical_threshold = sensor_config.processing.critical_threshold
             
         device_id = event.get('source')
         if not device_id:
@@ -82,13 +97,13 @@ async def process_sensor_data(stream):
         # Calculate average in the current window
         avg_reading = stats['sum'] / stats['count']
         
-        if avg_reading > CRITICAL_THRESHOLD:
-            logger.warning(f"Anomaly detected for {device_id}! Avg: {avg_reading:.2f} > {CRITICAL_THRESHOLD}")
+        if avg_reading > critical_threshold:
+            logger.warning(f"Anomaly detected for {device_id}! Avg: {avg_reading:.2f} > {critical_threshold}")
             
             alert_data = {
                 "device_id": device_id,
                 "average_reading": avg_reading,
-                "threshold": CRITICAL_THRESHOLD,
+                "threshold": critical_threshold,
                 "severity": "HIGH"
             }
             

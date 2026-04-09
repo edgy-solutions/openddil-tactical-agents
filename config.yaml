@@ -1,0 +1,21 @@
+kafka:
+  brokers: "localhost:9092"
+  raw_topic: "raw-sensor-stream"
+  tactical_topic: "tactical-events"
+
+database:
+  url: "postgresql://openddil:openddil@localhost:5432/regional_db"
+
+sensors:
+  - dds_type: "temperature_sensor"
+    cloudevent_type: "openddil.sensor.temperature"
+    processing:
+      engine: "faust"
+      window_seconds: 10
+      critical_threshold: 85.0
+  - dds_type: "connection_monitor"
+    cloudevent_type: "openddil.sensor.Connection_Lost"
+    processing:
+      engine: "restate"
+      window_seconds: 45
+      critical_threshold: 0.0
