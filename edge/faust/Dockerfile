@@ -6,14 +6,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc g++ make librdkafka-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Create virtual environment
-RUN python -m venv /opt/venv
+# Install uv and create virtual environment
+RUN pip install --no-cache-dir uv && \
+    uv venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 
 # Install Python dependencies into a dedicated virtual environment
 # Assuming build context is the repository root
 COPY pyproject.toml .
-RUN pip install --no-cache-dir .
+RUN uv pip install --no-cache .
 
 # Stage 2: Debug (Optional, but highly recommended for testing)
 # Add comments indicating this stage is for development and troubleshooting only and must not be deployed to production.
