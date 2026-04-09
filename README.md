@@ -17,3 +17,10 @@ We use two distinct processing frameworks, mapped to specific tactical needs:
 * **Usage:** 
   * **Edge:** If a connection drops, `await ctx.sleep(45s)`. If the container reboots during those 45 seconds, Restate remembers the timer and wakes up exactly on time.
   * **Hub:** Projecting events into the local UI Read Model (CQRS) idempotently using `ctx.run` to guarantee exactly-once UI alerts.
+
+## Dynamic Configuration
+
+The tactical agents use a data-driven architecture powered by Pydantic. 
+All topics, thresholds, and sensor configurations are defined in `config.yaml` and validated via `config.py`.
+* Hardcoded thresholds and topics have been removed.
+* Agents dynamically pull configuration based on the CloudEvent type they process.

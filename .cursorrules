@@ -13,4 +13,7 @@
   - Strict CQRS pattern. The projector (`hub_restate_projector.py`) only writes to the read model table (`local_tactical_alerts`).
   - No external HTTP webhooks are allowed in the projector.
   - Use Restate's `ctx.sleep()` for durable timers and `ctx.run()` for side-effects (e.g., publishing to Kafka, inserting to DB).
+- **Configuration**:
+  - Do not hardcode topics, thresholds, or sensor types.
+  - Use `config.yaml` and the Pydantic models in `config.py` for dynamic configuration.
 - **Python Style**: Standard PEP 8, robust error handling, and `logging` are required.

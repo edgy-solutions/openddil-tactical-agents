@@ -28,3 +28,8 @@ You are an AI agent working on the `openddil-tactical-agents` repository. This r
 5. **Resilience**:
    - Handle exceptions gracefully inside the agents to prevent the Faust worker from crashing on malformed events.
    - Restate agents are naturally resilient to container crashes and network drops.
+
+6. **Dynamic Configuration**:
+   - Do not hardcode Kafka topics, thresholds, or sensor types.
+   - Use `config.yaml` and the Pydantic models in `config.py` to load dynamic settings.
+   - Agents should dynamically adapt their processing logic based on the `AppSettings` loaded.
