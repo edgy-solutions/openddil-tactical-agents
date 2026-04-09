@@ -8,13 +8,10 @@ This repository contains the autonomous agents that detect patterns in the `raw-
 
 We use two distinct processing frameworks, mapped to specific tactical needs:
 
-### 1. Faust (`faust_agents.py`)
+### 1. Faust (`edge/edge_faust_detector.py`)
 * **Best for:** High-throughput, stateless stream processing and time-windowing.
-* **Usage:** Tumbling averages, simple threshold detection, and projecting events into the local UI Read Model (CQRS).
+* **Usage:** Tumbling averages and simple threshold detection.
 
-### 2. Restate (`restate_agents.py`)
+### 2. Restate (`edge/edge_restate_detector.py`)
 * **Best for:** Complex state machines and durable timers that must survive container crashes and network drops.
 * **Usage:** E.g., If a connection drops, `await ctx.sleep(45s)`. If the container reboots during those 45 seconds, Restate remembers the timer and wakes up exactly on time.
-
-### Local UI Support
-The Faust application includes a "Projector" agent. Its only job is to blind-copy everything from `tactical-events` into the local PostgreSQL `local_tactical_alerts` table so the local ElectricSQL instance can sync it to the operator UI.

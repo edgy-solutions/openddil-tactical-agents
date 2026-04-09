@@ -6,12 +6,12 @@ You are an AI agent working on the `openddil-tactical-agents` repository. This r
 ## Core Directives
 
 1. **Faust Streaming Framework**:
-   - Used for high-speed stream processing in `faust_agents.py`.
+   - Used for high-speed stream processing in `edge/edge_faust_detector.py`.
    - Maintain the use of `@app.agent` decorators for stream processing.
    - State management must use Faust's built-in `Table` capabilities (e.g., tumbling windows).
 
 2. **Restate Durable Execution**:
-   - Used for long-running, stateful workflows in `restate_agents.py`.
+   - Used for long-running, stateful workflows in `edge/edge_restate_detector.py`.
    - Workflows must use Restate Virtual Objects keyed by `device_id`.
    - Use `ctx.sleep()` for durable timers and `ctx.run()` for side-effects (like publishing to Kafka).
 

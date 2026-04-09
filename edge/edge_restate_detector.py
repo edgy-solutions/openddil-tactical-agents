@@ -11,7 +11,7 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
-logger = logging.getLogger("restate-agents")
+logger = logging.getLogger("edge-restate-detector")
 
 KAFKA_BROKERS = "localhost:9092"
 TACTICAL_EVENTS_TOPIC = "tactical-events"
