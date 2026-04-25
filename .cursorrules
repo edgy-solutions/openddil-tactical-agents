@@ -16,4 +16,7 @@
 - **Configuration**:
   - Do not hardcode topics, thresholds, or sensor types.
   - Use `config.yaml` and the Pydantic models in `config.py` for dynamic configuration.
+- **Demo Scenario**: 
+  - `edge/faust_edge.py` and `hub/restate_hub.py` are the specific agents for the "Hero" Demo scenario.
+  - Demo orchestration and React UIs are located in the `openddil-demo` repository.
 - **Python Style**: Standard PEP 8, robust error handling, and `logging` are required.

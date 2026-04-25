@@ -33,3 +33,8 @@ You are an AI agent working on the `openddil-tactical-agents` repository. This r
    - Do not hardcode Kafka topics, thresholds, or sensor types.
    - Use `config.yaml` and the Pydantic models in `config.py` to load dynamic settings.
    - Agents should dynamically adapt their processing logic based on the `AppSettings` loaded.
+
+7. **Demo Scenario Agents**:
+   - `edge/faust_edge.py` handles fast-twitch streaming analytics for the "Hero" Demo scenario.
+   - `hub/restate_hub.py` manages the durable Saga workflow for the demo (updating local state and queueing ALCS API requests).
+   - The UI and demo orchestration live in the `openddil-demo` repository.
