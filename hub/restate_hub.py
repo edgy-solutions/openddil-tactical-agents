@@ -4,13 +4,16 @@ import sqlite3
 import httpx
 import logging
 import json
+import os
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("restate_hub")
 
+DB_PATH = os.environ.get("DB_PATH", "edge_state.db")
+
 # Ensure table exists
 def init_db():
-    conn = sqlite3.connect('edge_state.db')
+    conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS radar_state (
@@ -44,7 +47,7 @@ async def process_anomaly(ctx: Context, event: bytes):
     
     # Step 1: Local State
     def update_local_db():
-        conn = sqlite3.connect('edge_state.db')
+        conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
         cursor.execute(
             'INSERT INTO radar_state (device_id, radar_status, transmit_power) VALUES (?, ?, ?)',
@@ -81,4 +84,5 @@ app = restate.app([TacticalSaga])
 
 if __name__ == '__main__':
     # Typically served using a web framework like hypercorn or uvicorn
-    pass
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=9080)
