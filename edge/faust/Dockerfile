@@ -28,10 +28,14 @@ COPY . /app/
 CMD ["python", "edge/edge_faust_detector.py", "worker", "-l", "info"]
 
 # Stage 3: Production
+FROM builder AS builder-production
+RUN rm /opt/venv/bin/python && ln -s /usr/bin/python3 /opt/venv/bin/python
+
+# Stage 4: Production
 FROM gcr.io/distroless/python3-debian12 AS production
 
 # Copy only the virtual environment (/opt/venv) from the Builder stage
-COPY --from=builder /opt/venv /opt/venv
+COPY --from=builder-production /opt/venv /opt/venv
 
 # Copy only the final application source code needed for runtime
 WORKDIR /app
