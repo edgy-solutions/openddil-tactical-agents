@@ -23,7 +23,7 @@ sensor_window = app.Table(
 
 @app.agent(raw_sensor_topic)
 async def process_sensor_data(stream):
-    async for event in stream.group_by(lambda x: x.get('device_id')):
+    async for event in stream.group_by(lambda x: x.get('device_id'), name='device_id_group'):
         device_id = event.get('device_id')
         if device_id != 'LTAMDS-04':
             continue
