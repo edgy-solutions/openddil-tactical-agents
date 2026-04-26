@@ -2,6 +2,7 @@ import faust
 import datetime
 import logging
 import json
+import uuid
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("faust_edge")
@@ -20,6 +21,19 @@ sensor_window = app.Table(
     'sensor_stats',
     default=lambda: {'sum_temp': 0.0, 'sum_pressure': 0.0, 'count': 0},
 ).tumbling(10.0, expires=datetime.timedelta(seconds=10.0))
+
+recent_alerts = []
+latest_telemetry = {"thermal": 32.0, "pressure": 120.0}
+
+@app.page('/alerts')
+class Alerts(faust.web.View):
+    async def get(self, request):
+        return self.json(recent_alerts[-50:])
+
+@app.page('/telemetry')
+class Telemetry(faust.web.View):
+    async def get(self, request):
+        return self.json(latest_telemetry)
 
 @app.agent(raw_sensor_topic)
 async def process_sensor_data(stream):
@@ -43,11 +57,14 @@ async def process_sensor_data(stream):
         avg_temp = stats['sum_temp'] / stats['count']
         avg_pressure = stats['sum_pressure'] / stats['count']
         
+        latest_telemetry["thermal"] = avg_temp
+        latest_telemetry["pressure"] = avg_pressure
+        
         if avg_temp > 45.0 or avg_pressure < 90.0:
             logger.warning(f"CRITICAL ANOMALY DETECTED for {device_id}! Avg Temp: {avg_temp:.2f}, Avg Pressure: {avg_pressure:.2f}")
             
             payload = {
-                "id": "generated-uuid", 
+                "id": str(uuid.uuid4()), 
                 "source": device_id,
                 "type": "CriticalAnomaly",
                 "time": datetime.datetime.utcnow().isoformat() + "Z",
@@ -58,6 +75,26 @@ async def process_sensor_data(stream):
                     "severity": "CRITICAL"
                 }
             }
+            
+            # Add to alerts for UI
+            time_str = datetime.datetime.utcnow().strftime("%H:%M:%S")
+            recent_alerts.append({
+                "id": payload["id"],
+                "msg": f"CRITICAL: Thermal Runaway Predicted. Avg Temp: {avg_temp:.2f}",
+                "type": "crit",
+                "time": time_str
+            })
+            recent_alerts.append({
+                "id": payload["id"] + "-action",
+                "msg": f"ACTION: Power Throttled via Restate Agent",
+                "type": "warn",
+                "time": time_str
+            })
+            
+            # Keep only last 50
+            if len(recent_alerts) > 50:
+                recent_alerts.pop(0)
+                recent_alerts.pop(0)
             
             await tactical_events_topic.send(key=device_id.encode('utf-8'), value=payload)
 
