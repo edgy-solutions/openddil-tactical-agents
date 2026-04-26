@@ -23,12 +23,27 @@ sensor_window = app.Table(
 ).tumbling(10.0, expires=datetime.timedelta(seconds=10.0))
 
 recent_alerts = []
+active_anomalies = {}
 latest_telemetry = {"thermal": 32.0, "pressure": 120.0}
 
 @app.page('/alerts')
 class Alerts(faust.web.View):
     async def get(self, request):
-        return self.json(recent_alerts[-50:])
+        alerts = []
+        for device_id, anomaly in active_anomalies.items():
+            alerts.append({
+                "id": anomaly["id"],
+                "msg": f"CRITICAL: Thermal Runaway Predicted. Avg Temp: {anomaly['temp']:.2f}",
+                "type": "crit",
+                "time": anomaly["time"]
+            })
+            alerts.append({
+                "id": anomaly["id"] + "-action",
+                "msg": f"ACTION: Power Throttled via Restate Agent",
+                "type": "warn",
+                "time": anomaly["time"]
+            })
+        return self.json(alerts)
 
 @app.page('/telemetry')
 class Telemetry(faust.web.View):
@@ -60,11 +75,15 @@ async def process_sensor_data(stream):
         latest_telemetry["thermal"] = avg_temp
         latest_telemetry["pressure"] = avg_pressure
         
-        if avg_temp > 45.0 or avg_pressure < 90.0:
+        is_anomalous = avg_temp > 45.0 or avg_pressure < 90.0
+        was_anomalous = device_id in active_anomalies
+        
+        if is_anomalous and not was_anomalous:
             logger.warning(f"CRITICAL ANOMALY DETECTED for {device_id}! Avg Temp: {avg_temp:.2f}, Avg Pressure: {avg_pressure:.2f}")
             
+            anomaly_id = str(uuid.uuid4())
             payload = {
-                "id": str(uuid.uuid4()), 
+                "id": anomaly_id, 
                 "source": device_id,
                 "type": "CriticalAnomaly",
                 "time": datetime.datetime.utcnow().isoformat() + "Z",
@@ -76,27 +95,18 @@ async def process_sensor_data(stream):
                 }
             }
             
-            # Add to alerts for UI
             time_str = datetime.datetime.utcnow().strftime("%H:%M:%S")
-            recent_alerts.append({
-                "id": payload["id"],
-                "msg": f"CRITICAL: Thermal Runaway Predicted. Avg Temp: {avg_temp:.2f}",
-                "type": "crit",
+            active_anomalies[device_id] = {
+                "id": anomaly_id,
+                "temp": avg_temp,
+                "pressure": avg_pressure,
                 "time": time_str
-            })
-            recent_alerts.append({
-                "id": payload["id"] + "-action",
-                "msg": f"ACTION: Power Throttled via Restate Agent",
-                "type": "warn",
-                "time": time_str
-            })
-            
-            # Keep only last 50
-            if len(recent_alerts) > 50:
-                recent_alerts.pop(0)
-                recent_alerts.pop(0)
+            }
             
             await tactical_events_topic.send(key=device_id.encode('utf-8'), value=payload)
+        elif not is_anomalous and was_anomalous:
+            logger.info(f"Anomaly resolved for {device_id}.")
+            del active_anomalies[device_id]
 
 if __name__ == '__main__':
     app.main()
