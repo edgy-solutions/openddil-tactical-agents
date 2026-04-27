@@ -1,0 +1,7 @@
+rules:
+  - id: rule-1
+    target_device: LTAMDS-04
+    sensor_field: core_temp
+    algorithm: absolute
+    threshold: 45.0
+    action_payload: LOG_ONLY
