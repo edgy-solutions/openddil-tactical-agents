@@ -53,7 +53,7 @@ sensor_window = app.Table(
 
 recent_alerts = []
 active_anomalies = {}
-latest_telemetry = {"thermal": 32.0, "pressure": 120.0}
+latest_telemetry = {}
 
 @app.page('/alerts')
 class Alerts(faust.web.View):
@@ -87,10 +87,12 @@ async def process_sensor_data(stream):
         if not device_id:
             continue
             
-        if "core_temp" in event:
-            latest_telemetry["thermal"] = event["core_temp"]
-        if "coolant_pressure" in event:
-            latest_telemetry["pressure"] = event["coolant_pressure"]
+        if device_id not in latest_telemetry:
+            latest_telemetry[device_id] = {}
+            
+        for k, v in event.items():
+            if k not in ["asset_id", "device_id", "type", "timestamp"]:
+                latest_telemetry[device_id][k] = v
 
         for rule in rules_config.get("rules", []):
             if rule.get("target_device") != device_id and rule.get("target_device") != "Global Fleet":
