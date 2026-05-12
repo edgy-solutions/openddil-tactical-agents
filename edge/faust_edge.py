@@ -1,176 +1,116 @@
-import faust
-import datetime
-import logging
+# =============================================================================
+# ADR-0007: Dual-path streaming architecture.
+# Migration target is Quix Streams for sub-10ms p99 latency and native
+# Protobuf+Schema Registry support. Faust is current; Quix is planned.
+# DO NOT leak Faust types (faust.Record, faust.Stream, App) into algorithms.py
+# or detection/units.py. The boundary is EventView/AssetState/Anomaly only.
+# =============================================================================
 import json
 import uuid
-import yaml
-import os
-import asyncio
-from watchdog.observers import Observer
-from watchdog.events import FileSystemEventHandler
+from datetime import datetime, timezone
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger("faust_edge")
+"""
+OpenDDIL Faust Edge Agent
+-------------------------
+Modernized anomaly detection for tactical telemetry.
 
-RULES_FILE = os.environ.get('RULES_FILE', '/app/rules.yaml')
-rules_config = {"rules": []}
-
-def load_rules():
-    global rules_config
-    try:
-        with open(RULES_FILE, 'r') as f:
-            rules_config = yaml.safe_load(f) or {"rules": []}
-            logger.info(f"Loaded rules: {rules_config}")
-    except Exception as e:
-        logger.error(f"Failed to load rules: {e}")
-
-class RuleReloader(FileSystemEventHandler):
-    def on_modified(self, event):
-        if event.src_path == RULES_FILE or os.path.abspath(event.src_path) == os.path.abspath(RULES_FILE):
-            logger.info(f"Rules file {RULES_FILE} modified. Reloading...")
-            load_rules()
-
-load_rules()
-
-observer = Observer()
-observer.schedule(RuleReloader(), path=os.path.dirname(RULES_FILE) or '.', recursive=False)
-observer.start()
+DEPLOYMENT NOTE:
+- Production: Uses `docker-compose.yml` which pulls pre-built images.
+- Development: Uses `docker-compose.override.yml` to build from source and
+               mount local code for hot-reloading.
+"""
+import faust
+from openddil.telemetry.v1 import telemetry_pb2 as pb
+from detection.algorithms import REGISTERED, EventView, AssetState, Anomaly
+from detection.units import from_proto
 
 app = faust.App(
-    'faust_edge_app',
-    broker='kafka://redpanda-edge:9092',
-    value_serializer='json',
+    "openddil-edge",
+    broker="kafka://redpanda-edge:9092",
+    value_serializer="raw",
 )
 
-raw_sensor_topic = app.topic('raw-sensor-stream')
-tactical_events_topic = app.topic('tactical-events')
+raw_topic = app.topic("raw-sensor-stream", value_type=bytes)
+state_topic = app.topic("telemetry-latest-state", value_type=bytes)
+events_topic = app.topic("tactical-events", value_type=bytes)
 
-# Tumbling window table
-sensor_window = app.Table(
-    'sensor_stats',
-    default=lambda: {'sum': 0.0, 'count': 0, 'values': []},
-).tumbling(10.0, expires=datetime.timedelta(seconds=10.0))
+# Faust-managed state record for RocksDB serialization.
+class StateRecord(faust.Record):
+    last_temp_k: float = 0.0
+    temp_ewma_k: float = 0.0
+    temp_ewma_alpha: float = 0.2
 
-recent_alerts = []
-active_anomalies = {}
-latest_telemetry = {}
+asset_state = app.Table(
+    "asset_state",
+    default=StateRecord,
+    partitions=8,
+)
 
-@app.page('/alerts')
-class Alerts(faust.web.View):
-    async def get(self, request):
-        alerts = []
-        for anomaly_id, anomaly in active_anomalies.items():
-            alerts.append({
-                "id": anomaly["id"],
-                "msg": anomaly["msg"],
-                "type": "crit",
-                "time": anomaly["time"]
-            })
-            if anomaly.get("action") != "LOG_ONLY":
-                alerts.append({
-                    "id": anomaly["id"] + "-action",
-                    "msg": f"ACTION: {anomaly.get('action')} via Restate Agent",
-                    "type": "warn",
-                    "time": anomaly["time"]
-                })
-        return self.json(alerts)
+def _build_view(evt: pb.EntityTelemetryEvent) -> EventView:
+    """Project proto -> algorithm-friendly view. Single conversion point."""
+    return EventView(
+        asset_id=evt.asset.asset_id,
+        sample_time_ns=evt.kinematics.position.valid_at.ToNanoseconds(),
+        component_temp=from_proto(evt.sustainment.thermal.component_temperature),
+        ambient_temp=from_proto(evt.sustainment.thermal.ambient_temperature),
+        ground_speed=from_proto(evt.kinematics.velocity.ground_speed),
+        fuel_remaining=from_proto(evt.sustainment.fluids.fuel_remaining),
+        bus_voltage=from_proto(evt.sustainment.power.bus_voltage),
+    )
 
-@app.page('/telemetry')
-class Telemetry(faust.web.View):
-    async def get(self, request):
-        return self.json(latest_telemetry)
-
-@app.agent(raw_sensor_topic)
-async def process_sensor_data(stream):
-    async for event in stream.group_by(lambda x: x.get('device_id'), name='device_id_group'):
-        device_id = event.get('device_id')
-        if not device_id:
+@app.agent(raw_topic)
+async def process(stream):
+    async for raw in stream:
+        evt = pb.EntityTelemetryEvent()
+        try:
+            evt.ParseFromString(raw)
+        except Exception as e:
+            import logging
+            logging.error(f"Failed to parse protobuf: {e}")
             continue
-            
-        if device_id not in latest_telemetry:
-            latest_telemetry[device_id] = {}
-            
-        for k, v in event.items():
-            if k not in ["asset_id", "device_id", "type", "timestamp"]:
-                latest_telemetry[device_id][k] = v
 
-        for rule in rules_config.get("rules", []):
-            if rule.get("target_device") != device_id and rule.get("target_device") != "Global Fleet":
-                continue
-                
-            sensor_field = rule.get("sensor_field")
-            if sensor_field not in event:
-                continue
-                
-            val = event[sensor_field]
-            if val is None:
-                continue
-                
-            window_key = f"{device_id}_{sensor_field}_{rule.get('id')}"
-            stats = sensor_window[window_key].current()
-            stats['sum'] += val
-            stats['count'] += 1
-            stats['values'].append(val)
-            sensor_window[window_key] = stats
-            
-            avg_val = stats['sum'] / stats['count']
-            
-            algorithm = rule.get("algorithm", "Absolute Threshold")
-            threshold = float(rule.get("threshold", 0.0))
-            
-            is_anomalous = False
-            
-            if algorithm == "Absolute Threshold" or algorithm == "absolute":
-                is_anomalous = avg_val > threshold
-            elif algorithm == "Rate of Change (Derivative)" or algorithm == "rate_of_change":
-                if len(stats['values']) >= 2:
-                    rate = stats['values'][-1] - stats['values'][0]
-                    is_anomalous = rate > threshold
-            elif algorithm == "Statistical Anomaly (Z-Score)" or algorithm == "z_score":
-                if len(stats['values']) > 2:
-                    mean = sum(stats['values']) / len(stats['values'])
-                    variance = sum((x - mean) ** 2 for x in stats['values']) / len(stats['values'])
-                    std_dev = variance ** 0.5
-                    if std_dev > 0:
-                        z_score = (val - mean) / std_dev
-                        is_anomalous = z_score > threshold
-            
-            anomaly_key = f"{device_id}_{rule.get('id')}"
-            was_anomalous = anomaly_key in active_anomalies
-            
-            if is_anomalous and not was_anomalous:
-                msg = f"WARNING: Temp threshold ({threshold}C) exceeded." if sensor_field == "core_temp" else f"ANOMALY: {sensor_field} exceeded threshold."
-                logger.warning(f"CRITICAL ANOMALY DETECTED for {device_id} rule {rule.get('id')}! {msg}")
-                
-                anomaly_id = str(uuid.uuid4())
-                payload = {
-                    "id": anomaly_id, 
-                    "source": device_id,
-                    "type": "CriticalAnomaly",
-                    "time": datetime.datetime.utcnow().isoformat() + "Z",
+        # 1. Forward to latest-state (preserving original bytes)
+        await state_topic.send(key=evt.asset.asset_id, value=raw)
+
+        # 2. Anomaly Detection Pipeline
+        view = _build_view(evt)
+        
+        # Load state from Table (StateRecord) -> Convert to Algo State (AssetState)
+        rec = asset_state[view.asset_id]
+        st = AssetState(
+            last_temp_k=rec.last_temp_k,
+            temp_ewma_k=rec.temp_ewma_k,
+            temp_ewma_alpha=rec.temp_ewma_alpha
+        )
+
+        for algo in REGISTERED:
+            anomaly = algo(view, st)
+            if anomaly:
+                # Convert Anomaly dataclass to CloudEvent-ish JSON for tactical-events
+                ce = {
+                    "specversion": "1.0",
+                    "id": str(uuid.uuid4()),
+                    "source": f"openddil/edge/{view.asset_id}",
+                    "type": f"openddil.anomaly.{anomaly.rule_id}",
+                    "subject": view.asset_id,
+                    "time": datetime.now(timezone.utc).isoformat(),
                     "datacontenttype": "application/json",
                     "data": {
-                        "rule_id": rule.get('id'),
-                        "sensor_field": sensor_field,
-                        "value": avg_val,
-                        "threshold": threshold,
-                        "action": rule.get("action_payload", "LOG_ONLY"),
-                        "severity": "CRITICAL"
+                        "severity": anomaly.severity,
+                        "summary": anomaly.summary,
+                        "evidence": anomaly.evidence
                     }
                 }
-                
-                time_str = datetime.datetime.utcnow().strftime("%H:%M:%S")
-                active_anomalies[anomaly_key] = {
-                    "id": anomaly_id,
-                    "msg": msg,
-                    "action": rule.get("action_payload", "LOG_ONLY"),
-                    "time": time_str
-                }
-                
-                await tactical_events_topic.send(key=device_id.encode('utf-8'), value=payload)
-            elif not is_anomalous and was_anomalous:
-                logger.info(f"Anomaly resolved for {device_id} rule {rule.get('id')}.")
-                del active_anomalies[anomaly_key]
+                await events_topic.send(
+                    key=view.asset_id,
+                    value=json.dumps(ce).encode('utf-8')
+                )
 
-if __name__ == '__main__':
+        # Sync back to Table (AssetState -> StateRecord)
+        rec.last_temp_k = st.last_temp_k or 0.0
+        rec.temp_ewma_k = st.temp_ewma_k or 0.0
+        rec.temp_ewma_alpha = st.temp_ewma_alpha
+        asset_state[view.asset_id] = rec
+
+if __name__ == "__main__":
     app.main()
