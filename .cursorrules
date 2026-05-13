@@ -20,3 +20,5 @@
   - `edge/faust_edge.py` and `hub/restate_hub.py` are the specific agents for the "Hero" Demo scenario.
   - Demo orchestration and React UIs are located in the `openddil-demo` repository.
 - **Python Style**: Standard PEP 8, robust error handling, and `logging` are required.
+- **Docker Compose (cross-repo rule)**: The faust-edge image is referenced from `openddil-demo/docker-compose.yml` as `image: ghcr.io/edgy-solutions/openddil/faust-edge:latest`. NEVER add a `build:` to the demo's base compose. Builds + source mounts live in `docker-compose.override.yml`. Publish a new image when `edge/Dockerfile` or baked files change.
+- **Phase 3.5 windowing boundary**: `edge/detection/windows.py` is pure Python — no Faust/Kafka imports. Faust wraps it from `faust_edge.py`. Same boundary discipline as `algorithms.py`. Output proto: `openddil.logistics.v1.WindowedTelemetry`.

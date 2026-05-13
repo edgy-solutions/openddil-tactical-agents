@@ -23,3 +23,16 @@ This repository (`openddil-tactical-agents`) covers Phases 7.2 and 7.3 of the Op
 - **Data Format**: All output events must be CloudEvents.
 - **Database**: Use `asyncpg`. Writes go to the Regional DB, not HQ. Writes must be idempotent.
 - **No Webhooks**: The projector must not use external HTTP calls.
+
+## Phase 3.5 windowing
+- `edge/detection/windows.py` — pure-Python rolling-window math
+  (Sample, TrendResult, compute_trend). No Faust/Kafka imports.
+- Output proto: `openddil.logistics.v1.WindowedTelemetry`
+  (defined in openddil-contracts).
+- Consumed by `openddil-logistics-fusion-service`.
+
+## Docker Compose discipline (cross-repo)
+- Base `openddil-demo/docker-compose.yml` references
+  `image: ghcr.io/edgy-solutions/openddil/faust-edge:latest`. NEVER `build:` in base.
+- Builds + source mounts live in `openddil-demo/docker-compose.override.yml`.
+- Publish a new image when `edge/Dockerfile` or baked files change.

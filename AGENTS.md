@@ -38,3 +38,21 @@ You are an AI agent working on the `openddil-tactical-agents` repository. This r
    - `edge/faust_edge.py` handles fast-twitch streaming analytics for the "Hero" Demo scenario.
    - `hub/restate_hub.py` manages the durable Saga workflow for the demo (updating local state and queueing ALCS API requests).
    - The UI and demo orchestration live in the `openddil-demo` repository.
+
+8. **Docker Compose discipline (cross-repo rule)**:
+   - The Faust edge image is consumed by `openddil-demo/docker-compose.yml`
+     as `image: ghcr.io/edgy-solutions/openddil/faust-edge:latest`.
+   - The base demo compose MUST NOT contain a `build:` directive for
+     this image. Builds + source mounts live in
+     `openddil-demo/docker-compose.override.yml`.
+   - **When you change `edge/Dockerfile` or anything that ships in the
+     image, publish a new `ghcr.io/edgy-solutions/openddil/faust-edge:latest`** so a
+     customer or CI runner with only the base compose still gets the
+     updated agent.
+
+9. **Phase 3.5 windowing**:
+   - `edge/detection/windows.py` is pure-Python rolling-window math
+     (Sample, TrendResult, compute_trend). No Faust/Kafka imports.
+     Mirrors the boundary discipline already in `algorithms.py`.
+   - Output records are `openddil.logistics.v1.WindowedTelemetry`
+     (proto lives in `openddil-contracts`).

@@ -10,8 +10,42 @@ permissions:
   contents: read
   packages: write
 
+# All images publish under ghcr.io/edgy-solutions/openddil/<service>:latest.
+# `${{ github.repository_owner }}` resolves to `edgy-solutions` for this repo.
+# The openddil-demo base compose references each of these images directly.
+
 jobs:
-  build-edge-faust:
+  # The Hero-scenario edge agent referenced by openddil-demo/docker-compose.yml
+  # as `image: ghcr.io/edgy-solutions/openddil/faust-edge:latest`. Includes
+  # the Phase 3.5 rolling-window agent (detection/windows.py).
+  build-faust-edge:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+
+      - name: Log in to the Container registry
+        uses: docker/login-action@v2
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build faust-edge
+        uses: docker/build-push-action@v4
+        with:
+          context: ./edge
+          file: ./edge/Dockerfile
+          push: true
+          tags: ghcr.io/${{ github.repository_owner }}/openddil/faust-edge:latest
+
+  # Legacy Faust detector (separate codepath from the Hero faust_edge agent
+  # above). Kept building while consumers exist; not referenced by the demo
+  # base compose today.
+  build-edge-faust-detector:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -33,10 +67,11 @@ jobs:
           context: .
           file: ./edge/faust/Dockerfile
           push: true
-          tags: ghcr.io/${{ github.repository_owner }}/edge-faust-detector:latest
+          tags: ghcr.io/${{ github.repository_owner }}/openddil/edge-faust-detector:latest
           target: production
 
-  build-edge-restate:
+  # Legacy Restate detector. Same situation as above.
+  build-edge-restate-detector:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -58,10 +93,12 @@ jobs:
           context: .
           file: ./edge/restate/Dockerfile
           push: true
-          tags: ghcr.io/${{ github.repository_owner }}/edge-restate-detector:latest
+          tags: ghcr.io/${{ github.repository_owner }}/openddil/edge-restate-detector:latest
           target: production
 
-  build-hub-projector:
+  # Hub-side Restate projector referenced by openddil-demo/docker-compose.yml
+  # as `image: ghcr.io/edgy-solutions/openddil/hub-restate-projector:latest`.
+  build-hub-restate-projector:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -83,5 +120,5 @@ jobs:
           context: .
           file: ./hub/projector/Dockerfile
           push: true
-          tags: ghcr.io/${{ github.repository_owner }}/hub-restate-projector:latest
+          tags: ghcr.io/${{ github.repository_owner }}/openddil/hub-restate-projector:latest
           target: production
