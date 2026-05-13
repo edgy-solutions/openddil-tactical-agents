@@ -5,14 +5,15 @@ logging.basicConfig(level=logging.INFO)
 
 def run_smoke_test():
     try:
-        from openddil.telemetry.v1 import telemetry_pb2 as pb
+        from openddil.telemetry.v1 import telemetry_pb2 as pb  # noqa: F401
+        from openddil.common.v1 import quantity_pb2 as qpb
         from detection.units import from_proto, to_proto
         import pint
-        
-        logging.info("1. Successfully imported telemetry_pb2 and detection.units")
-        
+
+        logging.info("1. Successfully imported telemetry_pb2/quantity_pb2 and detection.units")
+
         # Construct a proto Quantity
-        q_proto = pb.Quantity(value=100.0, unit="[degF]")
+        q_proto = qpb.Quantity(value=100.0, unit="[degF]")
         logging.info(f"2. Constructed Proto Quantity: {q_proto.value} {q_proto.unit}")
         
         # Convert to pint

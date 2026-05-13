@@ -11,7 +11,10 @@ RUN pip install --no-cache-dir \
     pyyaml \
     watchdog \
     pint==0.24.4 \
-    protobuf==5.28.3
+    # 2026-05-13: bumped from 5.28.3 — openddil-contracts/gen/python was
+    # regenerated with grpcio-tools 6.31.1 in Phase 2.5; gencode 6.x requires
+    # runtime 6.x or newer. Same fix as openddil-cm-service/pyproject.toml.
+    "protobuf>=6.30.0,<7.0.0"
 
 ENV PYTHONPATH=/app
 
