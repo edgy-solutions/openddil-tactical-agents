@@ -35,6 +35,11 @@ from detection.windows import (
     proto_to_pint,
     trend_to_proto,
 )
+# Phase 5 prognostics derivation engine — the one-line seam (ADR-0020).
+# `register(app)` below adds the engine's own agent + Table; this is the
+# *only* coupling. To extract the engine into its own service later,
+# delete the import and the call site at the bottom of this file.
+from prognostics import register as register_prognostics
 
 app = faust.App(
     "openddil-edge",
@@ -67,7 +72,13 @@ class StateRecord(faust.Record):
 asset_state = app.Table(
     "asset_state",
     default=StateRecord,
-    partitions=8,
+    # MUST match raw-sensor-stream's partition count. See
+    # openddil-tactical-agents/README.md "Faust Tables — the
+    # partition-count invariant" for why this is strict-but-invisible
+    # until the app has more than one Table. Was `partitions=8` for
+    # a long time; surfaced as a crash-loop the moment Phase 5 added
+    # the second Table.
+    partitions=1,
 )
 
 def _build_view(evt: pb.EntityTelemetryEvent) -> EventView:
@@ -290,6 +301,8 @@ async def process(stream):
         rec.temp_ewma_k = st.temp_ewma_k or 0.0
         rec.temp_ewma_alpha = st.temp_ewma_alpha
         asset_state[view.asset_id] = rec
+
+register_prognostics(app)
 
 if __name__ == "__main__":
     app.main()

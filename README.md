@@ -27,3 +27,40 @@ The tactical agents use a data-driven architecture powered by Pydantic.
 All topics, thresholds, and sensor configurations are defined in `config.yaml` and validated via `config.py`.
 * Hardcoded thresholds and topics have been removed.
 * Agents dynamically pull configuration based on the CloudEvent type they process.
+
+## Faust Tables — the partition-count invariant (READ BEFORE ADDING A TABLE)
+
+Every `app.Table(...)` declaration in the edge faust app **must use the same
+`partitions=N` as the source topic the agents consume.** Today
+`raw-sensor-stream` has 1 partition, so every Table declares `partitions=1`.
+
+### Why the trap is invisible until it triggers
+
+Faust requires `source_topic.partitions == changelog_topic.partitions` so
+per-partition state stays co-located on the same consumer. **It enforces
+this strictly only when an app has more than one Table.** With a single
+Table, a mismatch can sit latent for arbitrarily long without crashing —
+faust-edge ran 13 hours stable with `asset_state` declared `partitions=8`
+against a 1-partition source. Adding the Phase 5 prognostics Table flipped
+Faust into strict mode and both agents (the existing `process` and the new
+`prognostics_process`) crash-looped with `PartitionsMismatch`. The bug had
+been there the whole time; adding the second Table just made it visible.
+
+### What to do when you add `app.Table(...)` #3 (or change the source's partitions)
+
+- Set `partitions=` to match `raw-sensor-stream`'s current partition count.
+  If you don't know it, run
+  `docker compose exec redpanda-edge rpk topic describe raw-sensor-stream --print-partitions`.
+- If you need higher parallelism, re-partition the **source topic** first
+  and update **every** Table in the app in the same change. There is no
+  per-Table partition count — they all align with the source or nothing
+  works.
+- If you change the partition count of an existing Table, the existing
+  changelog topic on the broker will keep its old partition count and
+  Faust will refuse to start. Delete the stale changelog
+  (`rpk topic delete openddil-edge-<table-name>-changelog`) so Faust
+  recreates it with the new count.
+
+Both current Tables (`asset_state` in `edge/faust_edge.py` and
+`prognostics_accumulators` in `edge/prognostics/agent.py`) point back to
+this section in their inline comments.
