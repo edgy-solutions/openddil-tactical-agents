@@ -164,6 +164,17 @@ def _build_derived_event(
         out.provenance.sample_time.GetCurrentTime()
     out.provenance.ingest_time.GetCurrentTime()
     out.provenance.classification = "U"
+    # Origin-node provenance (ADR-0022 / ADR-0023). Inherit from the source
+    # event if it carries them (raw-sensor-stream events do post-6a); fall
+    # back to the env defaults of the faust-edge instance the prognostics
+    # engine runs inside. Either way the derived event ends up edge-attributed.
+    import os as _os
+    out.provenance.edge_id = (
+        src.provenance.edge_id or _os.getenv("OPENDDIL_EDGE_ID", "edge-01")
+    )
+    out.provenance.region_id = (
+        src.provenance.region_id or _os.getenv("OPENDDIL_REGION_ID", "region-01")
+    )
     return out
 
 
