@@ -4,12 +4,19 @@ ADR-0023 Phase 6b §B. One aggregator App per region, bound to redpanda-hq.
 Owns ALL state (RocksDB Tables); source Apps are stateless wrap-and-
 forward.
 
-Inputs:
-  - per-region fan-in topic on hq (from source Apps, wraps edge-cluster
-    events in a RegionalAggregatorInput envelope)
-  - asset-cm-state on hq (cm-service produces directly to hq per §A;
-    no source App needs to fan it in — the aggregator consumes it
-    natively from its own broker)
+Input (single):
+  - per-region fan-in topic on hq. ALL upstream sources (edge-cluster
+    per-asset topics AND hq-cluster asset-cm-state) flow through this
+    topic via source Apps that wrap each event in a
+    RegionalAggregatorInput envelope. Single-source-topic discipline
+    keeps the Faust Tables partition invariant trivially satisfied:
+    fan-in is partitions=1, Tables are partitions=1, no
+    PartitionsMismatch on multi-source agents.
+
+    asset-cm-state lives on hq at 8 partitions (per §A); routing it
+    through the 1-partition fan-in via a hq source App preserves that
+    topic's existing partition count for the projector's own consumer
+    while giving the aggregator a single-partition view.
 
 Per-asset Table (`region_assets_latest`) keyed by asset_id. Tracks each
 asset's latest contributions to all three rollups:
@@ -113,7 +120,6 @@ def make_aggregator_app(
     )
 
     fan_in = app.topic(fan_in_topic, value_type=bytes)
-    cm_state = app.topic("asset-cm-state", value_type=bytes)
 
     out_fleet_summary = app.topic(_TOPIC_FLEET_SUMMARY, value_type=bytes)
     out_top_factors = app.topic(_TOPIC_TOP_FACTORS, value_type=bytes)
@@ -121,6 +127,11 @@ def make_aggregator_app(
 
     @app.agent(fan_in)
     async def on_fan_in(stream):
+        """Single agent consuming the per-region fan-in topic. Dispatches
+        by the envelope's oneof tag. All upstream sources funnel here via
+        source Apps (edge-cluster per-asset topics via per-edge source
+        Apps + sidecar producer; asset-cm-state via the hq cm-state
+        source App)."""
         async for raw in stream:
             if not raw:
                 continue
@@ -140,27 +151,6 @@ def make_aggregator_app(
                             region_id, env.region_id)
                 continue
             await _dispatch_envelope(env, assets_latest)
-
-    @app.agent(cm_state)
-    async def on_cm_state(stream):
-        """cm-state JSON is produced to hq directly by cm-service. The
-        aggregator consumes it natively from its own broker — no source-
-        App fan-in needed for this topic."""
-        async for raw in stream:
-            if not raw:
-                continue
-            try:
-                envelope = json.loads(raw)
-            except Exception as exc:
-                log.warning("aggregator(%s): bad cm-state JSON (len=%d): %s",
-                            region_id, len(raw), exc)
-                continue
-            event_region = envelope.get("region_id") or ""
-            # cm-service produces ALL regions' cm-state to one hq topic;
-            # filter to just this region's assets.
-            if event_region and event_region != region_id:
-                continue
-            await _apply_cm_state(envelope, assets_latest)
 
     @app.timer(interval=timedelta(seconds=_HEARTBEAT_S))
     async def heartbeat():

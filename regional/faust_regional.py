@@ -47,7 +47,7 @@ import sys
 import faust
 
 from aggregator_app import make_aggregator_app
-from source_app import make_source_app
+from source_app import make_cm_state_source_app, make_source_app
 
 
 log = logging.getLogger("faust_regional.main")
@@ -112,6 +112,16 @@ def main() -> int:
         )
         services.append(source_app)
         services.append(hq_producer)
+
+    # HQ cm-state source — routes asset-cm-state through the fan-in topic.
+    # See aggregator_app.py docstring for the partition-invariant rationale.
+    cm_state_source = make_cm_state_source_app(
+        region_id=region_id,
+        hq_brokers=hq_brokers,
+        fan_in_topic=fan_in_topic,
+        web_port=6067 + len(edges),
+    )
+    services.append(cm_state_source)
 
     worker = faust.Worker(aggregator, *services, loglevel="info")
     worker.execute_from_commandline()

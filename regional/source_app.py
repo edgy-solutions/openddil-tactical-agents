@@ -192,6 +192,72 @@ async def _wrap_and_forward_windowed_telemetry(
 
 
 # ---------------------------------------------------------------------------
+# CM-state source App — bound to hq, subscribes to asset-cm-state, wraps
+# JSON-bytes payloads into the envelope's asset_cm_state_json oneof slot,
+# produces to the fan-in topic on the SAME broker (no aiokafka sidecar
+# needed — Faust's native producer handles same-broker produces).
+# ---------------------------------------------------------------------------
+
+def make_cm_state_source_app(
+    *,
+    region_id: str,
+    hq_brokers: str,
+    fan_in_topic: str,
+    web_port: int,
+) -> faust.App:
+    """Build the hq cm-state source App.
+
+    Routes asset-cm-state events through the per-region fan-in topic so
+    the aggregator's Tables see a single source-topic partition count
+    (matches the partition invariant; avoids Faust's PartitionsMismatch
+    when the aggregator would otherwise subscribe to both fan-in
+    [partitions=1] and asset-cm-state [partitions=8] directly).
+    """
+    import json
+    app_id = f"region-{region_id}-cm-state-source"
+    app = faust.App(
+        app_id,
+        broker=f"kafka://{hq_brokers}",
+        store="memory://",
+        value_serializer="raw",
+        web_port=web_port,
+    )
+
+    in_topic = app.topic("asset-cm-state", value_type=bytes)
+    out_topic = app.topic(fan_in_topic, value_type=bytes)
+
+    @app.agent(in_topic)
+    async def on_cm_state(stream):
+        async for raw in stream:
+            if not raw:
+                continue
+            # Filter to this region's events. cm-service produces all
+            # regions' cm-state to one topic; the source App tags by
+            # extracting region_id from the JSON envelope and dropping
+            # mismatched events here rather than at the aggregator.
+            try:
+                envelope = json.loads(raw)
+            except Exception as exc:
+                log.warning("%s: bad cm-state JSON (len=%d): %s",
+                            app_id, len(raw), exc)
+                continue
+            event_region = envelope.get("region_id") or ""
+            if event_region and event_region != region_id:
+                continue
+            asset_id = envelope.get("asset_id") or ""
+            env = inp_pb.RegionalAggregatorInput(
+                source_edge_id=envelope.get("edge_id") or "",
+                region_id=region_id,
+                wrapped_at=_now_timestamp(),
+                asset_id=asset_id,
+                asset_cm_state_json=raw if isinstance(raw, (bytes, bytearray)) else bytes(raw),
+            )
+            await out_topic.send(key=asset_id, value=env.SerializeToString())
+
+    return app
+
+
+# ---------------------------------------------------------------------------
 # Sidecar HQ producer
 # ---------------------------------------------------------------------------
 
