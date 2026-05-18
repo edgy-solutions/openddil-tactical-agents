@@ -43,16 +43,17 @@ from openddil.telemetry.v1 import telemetry_pb2 as tpb
 log = logging.getLogger("faust_regional.source")
 
 
-# Source topics consumed from each edge cluster. The cm-state topic is
-# different — it's on hq, not on the edge — so it's handled by the
-# aggregator App directly, NOT by source Apps. See aggregator_app.py.
-_EDGE_SOURCE_TOPICS = (
-    "asset-logistics-status",     # AssetLogisticsStatusUpdate (proto)
-    "derived-sustainment",        # EntityTelemetryEvent (proto)
-    "asset-telemetry-windows",    # WindowedTelemetry (proto) — wired but
-                                  # does NOT drive emissions in §B; see
-                                  # ASYMMETRIC COVERAGE in faust_regional.py
-)
+# Per-edge source App subscriptions. ONLY topics actually produced on
+# the edge brokers go here. Per §A migrations, asset-cm-state and
+# asset-logistics-status are produced to redpanda-hq (not per-edge), so
+# they live on the hq source App (see make_hq_source_app below). The
+# per-edge source App consumes:
+#   - derived-sustainment (faust-edge prognostics produces here)
+#   - asset-telemetry-windows (faust-edge windowing produces here; wired
+#     but DEBUG no-op in aggregator per §B asymmetric coverage)
+# A per-edge subscription on asset-logistics-status would consume nothing
+# (fusion produces only to hq); dropping it avoids the spurious lag-zero
+# consumer group on every edge broker.
 
 
 def make_source_app(
@@ -87,14 +88,6 @@ def make_source_app(
     # enough to extract asset_id (so the envelope can carry it for
     # partitioning), then wraps the raw bytes into the envelope's oneof
     # payload and hands the serialized envelope to the sidecar producer.
-
-    @app.agent(app.topic("asset-logistics-status", value_type=bytes))
-    async def on_logistics_status(stream):
-        async for raw in stream:
-            await _wrap_and_forward_logistics_status(
-                raw=raw, edge_id=edge_id, region_id=region_id,
-                fan_in_topic=fan_in_topic, producer=hq_producer,
-            )
 
     @app.agent(app.topic("derived-sustainment", value_type=bytes))
     async def on_derived_sustainment(stream):
@@ -192,29 +185,34 @@ async def _wrap_and_forward_windowed_telemetry(
 
 
 # ---------------------------------------------------------------------------
-# CM-state source App — bound to hq, subscribes to asset-cm-state, wraps
-# JSON-bytes payloads into the envelope's asset_cm_state_json oneof slot,
+# HQ source App — bound to hq broker, consumes the topics that are
+# produced ON hq (not on per-edge brokers): asset-cm-state and
+# asset-logistics-status per §A. Wraps each event into the envelope and
 # produces to the fan-in topic on the SAME broker (no aiokafka sidecar
 # needed — Faust's native producer handles same-broker produces).
+#
+# Why route through fan-in rather than letting the aggregator subscribe
+# directly: asset-cm-state and asset-logistics-status both have
+# partitions=8 (existing config; per-asset rows distributed). The
+# aggregator Tables are partitions=1 to match the fan-in topic. Faust's
+# PartitionsMismatch fires if an agent updates a Table from a
+# differently-partitioned source. Wrap-and-republish gives the aggregator
+# a single-partition view.
 # ---------------------------------------------------------------------------
 
-def make_cm_state_source_app(
+def make_hq_source_app(
     *,
     region_id: str,
     hq_brokers: str,
     fan_in_topic: str,
     web_port: int,
 ) -> faust.App:
-    """Build the hq cm-state source App.
-
-    Routes asset-cm-state events through the per-region fan-in topic so
-    the aggregator's Tables see a single source-topic partition count
-    (matches the partition invariant; avoids Faust's PartitionsMismatch
-    when the aggregator would otherwise subscribe to both fan-in
-    [partitions=1] and asset-cm-state [partitions=8] directly).
+    """Build the hq source App. Consumes asset-cm-state (JSON) and
+    asset-logistics-status (proto) from hq; wraps each into the envelope
+    and forwards to the per-region fan-in topic.
     """
     import json
-    app_id = f"region-{region_id}-cm-state-source"
+    app_id = f"region-{region_id}-hq-source"
     app = faust.App(
         app_id,
         broker=f"kafka://{hq_brokers}",
@@ -223,18 +221,25 @@ def make_cm_state_source_app(
         web_port=web_port,
     )
 
-    in_topic = app.topic("asset-cm-state", value_type=bytes)
+    cm_in_topic = app.topic("asset-cm-state", value_type=bytes)
+    log_in_topic = app.topic("asset-logistics-status", value_type=bytes)
     out_topic = app.topic(fan_in_topic, value_type=bytes)
 
-    @app.agent(in_topic)
+    @app.agent(cm_in_topic)
     async def on_cm_state(stream):
         async for raw in stream:
             if not raw:
                 continue
             # Filter to this region's events. cm-service produces all
-            # regions' cm-state to one topic; the source App tags by
-            # extracting region_id from the JSON envelope and dropping
-            # mismatched events here rather than at the aggregator.
+            # regions' cm-state to one topic; the source App requires a
+            # POSITIVE region match — events with empty region_id (pre-
+            # §A residuals; misconfigured upstream) are skipped entirely
+            # rather than ambiguously routed.
+            # Bug history (caught by test_47): the earlier
+            # `if event_region and event_region != region_id` filter
+            # evaluated falsy on empty-string region_id and wrapped the
+            # event to BOTH regions' fan-in topics, poisoning both
+            # aggregator Tables. Positive-match closes this.
             try:
                 envelope = json.loads(raw)
             except Exception as exc:
@@ -242,7 +247,7 @@ def make_cm_state_source_app(
                             app_id, len(raw), exc)
                 continue
             event_region = envelope.get("region_id") or ""
-            if event_region and event_region != region_id:
+            if event_region != region_id:
                 continue
             asset_id = envelope.get("asset_id") or ""
             env = inp_pb.RegionalAggregatorInput(
@@ -252,6 +257,34 @@ def make_cm_state_source_app(
                 asset_id=asset_id,
                 asset_cm_state_json=raw if isinstance(raw, (bytes, bytearray)) else bytes(raw),
             )
+            await out_topic.send(key=asset_id, value=env.SerializeToString())
+
+    @app.agent(log_in_topic)
+    async def on_logistics_status(stream):
+        async for raw in stream:
+            if not raw:
+                continue
+            upd = lpb.AssetLogisticsStatusUpdate()
+            try:
+                upd.ParseFromString(raw)
+            except Exception as exc:
+                log.warning("%s: bad AssetLogisticsStatusUpdate (len=%d): %s",
+                            app_id, len(raw), exc)
+                continue
+            # Filter to this region — POSITIVE match (see on_cm_state
+            # above for the bug-history note about empty-region_id
+            # ambiguous routing).
+            event_region = upd.provenance.region_id or ""
+            if event_region != region_id:
+                continue
+            asset_id = upd.status.asset_id or ""
+            env = inp_pb.RegionalAggregatorInput(
+                source_edge_id=upd.provenance.edge_id or "",
+                region_id=region_id,
+                wrapped_at=_now_timestamp(),
+                asset_id=asset_id,
+            )
+            env.logistics_status.CopyFrom(upd)
             await out_topic.send(key=asset_id, value=env.SerializeToString())
 
     return app
