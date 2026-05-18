@@ -138,6 +138,19 @@ def _emit_window_for_asset(evt: pb.EntityTelemetryEvent,
     out.asset_id = aid
     out.platform_variant = evt.asset.platform_variant or ""
     out.computed_at.FromNanoseconds(now_ns)
+    # ADR-0023 Phase 6b §A.2: stamp origin-node provenance from this
+    # faust-edge instance's env (faust-edge is already per-edge). The
+    # projector telemetry_windows handler reads this with env-default
+    # fallback; faust-regional's region-wear-trends aggregator (§B)
+    # consumes it as an attributed input. Inherit producer_id/sample_time
+    # from the source event when possible.
+    if evt.provenance.sample_time.seconds or evt.provenance.sample_time.nanos:
+        out.provenance.sample_time.CopyFrom(evt.provenance.sample_time)
+    out.provenance.producer_id = "faust-edge"
+    out.provenance.edge_id = OPENDDIL_EDGE_ID
+    out.provenance.region_id = OPENDDIL_REGION_ID
+    out.provenance.ingest_time.FromNanoseconds(now_ns)
+    out.provenance.classification = "U"
 
     total_samples = 0
     window_min_start: int | None = None
