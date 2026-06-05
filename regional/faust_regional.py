@@ -37,6 +37,11 @@ Env config:
   REGIONAL_FAN_IN_TOPIC         — default "region-<region_id>-fan-in"
   REGIONAL_HEARTBEAT_INTERVAL_S — default "30"
   REGIONAL_TOP_FACTORS_N        — default "10"
+  REGIONAL_ASSET_REGISTRY_TOPIC — default "asset-registry-events"
+                                  ADR-0028: HQ topic the HQ source App
+                                  subscribes to so it can fill in the
+                                  empty provenance.region_id that cm-
+                                  service and logistics-fusion emit.
 """
 from __future__ import annotations
 
@@ -118,11 +123,15 @@ def main() -> int:
     # partitions; routing through the 1-partition fan-in preserves Tables
     # partition invariant. See aggregator_app.py docstring for full
     # rationale.
+    asset_registry_topic = os.getenv(
+        "REGIONAL_ASSET_REGISTRY_TOPIC", "asset-registry-events",
+    )
     hq_source = make_hq_source_app(
         region_id=region_id,
         hq_brokers=hq_brokers,
         fan_in_topic=fan_in_topic,
         web_port=6067 + len(edges),
+        asset_registry_topic=asset_registry_topic,
     )
     services.append(hq_source)
 

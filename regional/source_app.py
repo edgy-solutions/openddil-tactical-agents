@@ -43,6 +43,71 @@ from openddil.telemetry.v1 import telemetry_pb2 as tpb
 log = logging.getLogger("faust_regional.source")
 
 
+# ---------------------------------------------------------------------------
+# ADR-0028 asset_id -> (edge_id, region_id) cache.
+#
+# cm-service and logistics-fusion emit events with empty
+# provenance.region_id. The positive-match filter on the HQ source App
+# (lines 252 + 281) then dropped 100% of those events -- the rollup gap
+# that prompted ADR-0028. Phase 2 fix: subscribe to asset-registry-
+# events (HQ broker, log-compacted), build a per-asset cache, look up
+# empty region_id from cache before applying the positive-match filter.
+#
+# Bootstrap: at first-ever pod start the cache is empty; Faust reads
+# the compacted asset-registry-events topic from earliest so the
+# cache populates within seconds. Events that arrive before the cache
+# has the asset hit a brief hold-and-retry (RETRY_DELAY_S *
+# RETRY_MAX_ATTEMPTS wall time) and are dropped with a warning if
+# still missing.
+#
+# Restart caveat: Faust commits the cache agent's offset. After
+# restart, assets with no recent observations may briefly be absent
+# from the cache; they reappear on the next observation. For demo this
+# is acceptable. A startup SELECT-from-postgres warm path is a Phase 4
+# follow-up.
+# ---------------------------------------------------------------------------
+RETRY_DELAY_S = 0.2
+RETRY_MAX_ATTEMPTS = 3
+
+
+class _AssetRegistryCache:
+    """In-memory asset_id -> (edge_id, region_id) cache populated by
+    the asset-registry-events agent on the HQ source App."""
+
+    def __init__(self) -> None:
+        self._cache: dict[str, tuple[str, str]] = {}
+
+    def get(self, asset_id: str) -> Optional[tuple[str, str]]:
+        return self._cache.get(asset_id)
+
+    def set(self, asset_id: str, edge_id: str, region_id: str) -> None:
+        self._cache[asset_id] = (edge_id, region_id)
+
+    def size(self) -> int:
+        return len(self._cache)
+
+
+async def _resolve_region_from_cache(
+    cache: _AssetRegistryCache, asset_id: str, label: str,
+) -> Optional[str]:
+    """Look up asset_id in cache; hold-and-retry briefly to absorb
+    bootstrap latency (registry observation arrives ~ms after cm-state /
+    logistics-status). Returns the resolved region_id or None if still
+    missing after RETRY_MAX_ATTEMPTS."""
+    for attempt in range(RETRY_MAX_ATTEMPTS):
+        hit = cache.get(asset_id)
+        if hit is not None:
+            return hit[1]  # region_id
+        if attempt < RETRY_MAX_ATTEMPTS - 1:
+            await asyncio.sleep(RETRY_DELAY_S)
+    log.warning(
+        "%s: asset_id=%r missing from asset-registry cache after %d retries "
+        "(cache size=%d) -- dropping event",
+        label, asset_id, RETRY_MAX_ATTEMPTS, cache.size(),
+    )
+    return None
+
+
 # Per-edge source App subscriptions. ONLY topics actually produced on
 # the edge brokers go here. Per §A migrations, asset-cm-state and
 # asset-logistics-status are produced to redpanda-hq (not per-edge), so
@@ -206,10 +271,17 @@ def make_hq_source_app(
     hq_brokers: str,
     fan_in_topic: str,
     web_port: int,
+    asset_registry_topic: str = "asset-registry-events",
 ) -> faust.App:
     """Build the hq source App. Consumes asset-cm-state (JSON) and
     asset-logistics-status (proto) from hq; wraps each into the envelope
     and forwards to the per-region fan-in topic.
+
+    Also subscribes to `asset_registry_topic` (ADR-0028) on the same
+    hq broker to maintain an in-memory asset_id -> (edge_id, region_id)
+    cache. cm-state and logistics-status events with empty region_id
+    are resolved against this cache before the positive-match filter
+    runs -- closes the rollup gap that prompted ADR-0028.
     """
     import json
     app_id = f"region-{region_id}-hq-source"
@@ -223,7 +295,37 @@ def make_hq_source_app(
 
     cm_in_topic = app.topic("asset-cm-state", value_type=bytes)
     log_in_topic = app.topic("asset-logistics-status", value_type=bytes)
+    registry_in_topic = app.topic(asset_registry_topic, value_type=bytes)
     out_topic = app.topic(fan_in_topic, value_type=bytes)
+
+    # ADR-0028 Phase 2: cache lives for the App's lifetime, shared
+    # across the three agents below. Faust runs agents on the same
+    # event loop within a Worker, so a plain dict is safe -- no lock
+    # needed.
+    registry_cache = _AssetRegistryCache()
+
+    @app.agent(registry_in_topic)
+    async def on_asset_registry_event(stream):
+        async for raw in stream:
+            if not raw:
+                continue
+            try:
+                event = json.loads(raw)
+            except Exception as exc:
+                log.warning("%s: bad asset-registry-events JSON (len=%d): %s",
+                            app_id, len(raw), exc)
+                continue
+            asset_id = event.get("asset_id") or ""
+            if not asset_id:
+                continue
+            edge_id_val = event.get("edge_id") or ""
+            region_id_val = event.get("region_id") or ""
+            if not region_id_val:
+                # Registry deliberately emitted no region -- treat as
+                # "no usable mapping yet". Don't overwrite an existing
+                # cached entry with empty data.
+                continue
+            registry_cache.set(asset_id, edge_id_val, region_id_val)
 
     @app.agent(cm_in_topic)
     async def on_cm_state(stream):
@@ -232,24 +334,33 @@ def make_hq_source_app(
                 continue
             # Filter to this region's events. cm-service produces all
             # regions' cm-state to one topic; the source App requires a
-            # POSITIVE region match — events with empty region_id (pre-
-            # §A residuals; misconfigured upstream) are skipped entirely
-            # rather than ambiguously routed.
+            # POSITIVE region match -- events with empty region_id are
+            # resolved via the asset-registry cache (ADR-0028 Phase 2)
+            # before being filtered.
+            #
             # Bug history (caught by test_47): the earlier
             # `if event_region and event_region != region_id` filter
             # evaluated falsy on empty-string region_id and wrapped the
             # event to BOTH regions' fan-in topics, poisoning both
-            # aggregator Tables. Positive-match closes this.
+            # aggregator Tables. Positive-match closes this; the
+            # registry-cache lookup keeps the filter strict while
+            # backfilling the region_id cm-service can't compute itself.
             try:
                 envelope = json.loads(raw)
             except Exception as exc:
                 log.warning("%s: bad cm-state JSON (len=%d): %s",
                             app_id, len(raw), exc)
                 continue
+            asset_id = envelope.get("asset_id") or ""
             event_region = envelope.get("region_id") or ""
+            if not event_region:
+                if not asset_id:
+                    continue  # no key to resolve against
+                event_region = await _resolve_region_from_cache(
+                    registry_cache, asset_id, f"{app_id}/cm-state",
+                ) or ""
             if event_region != region_id:
                 continue
-            asset_id = envelope.get("asset_id") or ""
             env = inp_pb.RegionalAggregatorInput(
                 source_edge_id=envelope.get("edge_id") or "",
                 region_id=region_id,
@@ -271,13 +382,23 @@ def make_hq_source_app(
                 log.warning("%s: bad AssetLogisticsStatusUpdate (len=%d): %s",
                             app_id, len(raw), exc)
                 continue
-            # Filter to this region — POSITIVE match (see on_cm_state
+            # Filter to this region -- POSITIVE match (see on_cm_state
             # above for the bug-history note about empty-region_id
-            # ambiguous routing).
+            # ambiguous routing). Empty region_id resolves via the
+            # asset-registry cache (ADR-0028 Phase 2). logistics-fusion
+            # currently emits empty provenance.region_id for every
+            # event -- the cache lookup is the path that actually
+            # delivers any logistics-status events to the aggregator.
             event_region = upd.provenance.region_id or ""
+            asset_id = upd.status.asset_id or ""
+            if not event_region:
+                if not asset_id:
+                    continue
+                event_region = await _resolve_region_from_cache(
+                    registry_cache, asset_id, f"{app_id}/logistics-status",
+                ) or ""
             if event_region != region_id:
                 continue
-            asset_id = upd.status.asset_id or ""
             env = inp_pb.RegionalAggregatorInput(
                 source_edge_id=upd.provenance.edge_id or "",
                 region_id=region_id,
