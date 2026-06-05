@@ -40,72 +40,12 @@ from openddil.logistics.v1 import (
 from openddil.regional.v1 import regional_aggregator_input_pb2 as inp_pb
 from openddil.telemetry.v1 import telemetry_pb2 as tpb
 
+from asset_registry_cache import (
+    AssetRegistryCache,
+    resolve_region_from_cache,
+)
+
 log = logging.getLogger("faust_regional.source")
-
-
-# ---------------------------------------------------------------------------
-# ADR-0028 asset_id -> (edge_id, region_id) cache.
-#
-# cm-service and logistics-fusion emit events with empty
-# provenance.region_id. The positive-match filter on the HQ source App
-# (lines 252 + 281) then dropped 100% of those events -- the rollup gap
-# that prompted ADR-0028. Phase 2 fix: subscribe to asset-registry-
-# events (HQ broker, log-compacted), build a per-asset cache, look up
-# empty region_id from cache before applying the positive-match filter.
-#
-# Bootstrap: at first-ever pod start the cache is empty; Faust reads
-# the compacted asset-registry-events topic from earliest so the
-# cache populates within seconds. Events that arrive before the cache
-# has the asset hit a brief hold-and-retry (RETRY_DELAY_S *
-# RETRY_MAX_ATTEMPTS wall time) and are dropped with a warning if
-# still missing.
-#
-# Restart caveat: Faust commits the cache agent's offset. After
-# restart, assets with no recent observations may briefly be absent
-# from the cache; they reappear on the next observation. For demo this
-# is acceptable. A startup SELECT-from-postgres warm path is a Phase 4
-# follow-up.
-# ---------------------------------------------------------------------------
-RETRY_DELAY_S = 0.2
-RETRY_MAX_ATTEMPTS = 3
-
-
-class _AssetRegistryCache:
-    """In-memory asset_id -> (edge_id, region_id) cache populated by
-    the asset-registry-events agent on the HQ source App."""
-
-    def __init__(self) -> None:
-        self._cache: dict[str, tuple[str, str]] = {}
-
-    def get(self, asset_id: str) -> Optional[tuple[str, str]]:
-        return self._cache.get(asset_id)
-
-    def set(self, asset_id: str, edge_id: str, region_id: str) -> None:
-        self._cache[asset_id] = (edge_id, region_id)
-
-    def size(self) -> int:
-        return len(self._cache)
-
-
-async def _resolve_region_from_cache(
-    cache: _AssetRegistryCache, asset_id: str, label: str,
-) -> Optional[str]:
-    """Look up asset_id in cache; hold-and-retry briefly to absorb
-    bootstrap latency (registry observation arrives ~ms after cm-state /
-    logistics-status). Returns the resolved region_id or None if still
-    missing after RETRY_MAX_ATTEMPTS."""
-    for attempt in range(RETRY_MAX_ATTEMPTS):
-        hit = cache.get(asset_id)
-        if hit is not None:
-            return hit[1]  # region_id
-        if attempt < RETRY_MAX_ATTEMPTS - 1:
-            await asyncio.sleep(RETRY_DELAY_S)
-    log.warning(
-        "%s: asset_id=%r missing from asset-registry cache after %d retries "
-        "(cache size=%d) -- dropping event",
-        label, asset_id, RETRY_MAX_ATTEMPTS, cache.size(),
-    )
-    return None
 
 
 # Per-edge source App subscriptions. ONLY topics actually produced on
@@ -302,7 +242,7 @@ def make_hq_source_app(
     # across the three agents below. Faust runs agents on the same
     # event loop within a Worker, so a plain dict is safe -- no lock
     # needed.
-    registry_cache = _AssetRegistryCache()
+    registry_cache = AssetRegistryCache()
 
     @app.agent(registry_in_topic)
     async def on_asset_registry_event(stream):
@@ -356,7 +296,7 @@ def make_hq_source_app(
             if not event_region:
                 if not asset_id:
                     continue  # no key to resolve against
-                event_region = await _resolve_region_from_cache(
+                event_region = await resolve_region_from_cache(
                     registry_cache, asset_id, f"{app_id}/cm-state",
                 ) or ""
             if event_region != region_id:
@@ -394,7 +334,7 @@ def make_hq_source_app(
             if not event_region:
                 if not asset_id:
                     continue
-                event_region = await _resolve_region_from_cache(
+                event_region = await resolve_region_from_cache(
                     registry_cache, asset_id, f"{app_id}/logistics-status",
                 ) or ""
             if event_region != region_id:
