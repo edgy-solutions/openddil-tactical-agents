@@ -1,0 +1,43 @@
+name: Notify openddil-helm to rebuild runtime-bundle
+
+# Mirrors the openddil-contracts / openddil-stack notify workflows. The
+# runtime-bundle Dockerfile COPYs exactly one file from this repo:
+#   openddil-tactical-agents/hub/restate_hub.py -> /bundle/agents/hub/restate_hub.py
+#
+# So the paths filter is narrow on purpose. The faust apps (edge, regional,
+# tactical-detector) build their own Docker images via docker-build.yml --
+# they don't ride the bundle.
+#
+# Setup (one-time):
+#   1. Fine-grained PAT with Contents:write on edgy-solutions/openddil-helm,
+#      Metadata:read.
+#   2. Store as repo secret BUNDLE_REBUILD_PAT.
+#   3. openddil-helm's build-bundle.yml already listens on
+#      `repository_dispatch: types: [source-repo-changed]`.
+
+on:
+  push:
+    branches: [ "master" ]
+    paths:
+      - "hub/restate_hub.py"
+      - ".github/workflows/notify-bundle-rebuild.yml"
+  workflow_dispatch:
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Dispatch source-repo-changed to openddil-helm
+        uses: peter-evans/repository-dispatch@v3
+        with:
+          token: ${{ secrets.BUNDLE_REBUILD_PAT }}
+          repository: ${{ github.repository_owner }}/openddil-helm
+          event-type: source-repo-changed
+          client-payload: |
+            {
+              "source_repo":  "openddil-tactical-agents",
+              "ref":          "${{ github.ref }}",
+              "sha":          "${{ github.sha }}",
+              "actor":        "${{ github.actor }}",
+              "commit_url":   "${{ github.event.head_commit.url }}"
+            }
