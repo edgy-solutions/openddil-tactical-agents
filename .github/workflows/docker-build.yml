@@ -3,14 +3,19 @@ name: Docker Build
 on:
   push:
     branches: [ "master" ]
+    # Tag pushes (v1.0.0, ...) publish versioned images (:v1.0.0)
+    # alongside :latest so consumers can pin to a release.
+    tags: [ "v*" ]
   pull_request:
     branches: [ "master" ]
+  workflow_dispatch:
 
 permissions:
   contents: read
   packages: write
 
-# All images publish under ghcr.io/edgy-solutions/openddil/<service>:latest.
+# All images publish under ghcr.io/edgy-solutions/openddil/<service>:latest
+# AND additionally under :<tag-name> on a v* tag push.
 # `${{ github.repository_owner }}` resolves to `edgy-solutions` for this repo.
 # The openddil-demo base compose references each of these images directly.
 
@@ -34,13 +39,23 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Compute image tags
+        id: tags
+        run: |
+          REG=ghcr.io/${{ github.repository_owner }}/openddil/faust-edge
+          T="$REG:latest"
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            T="$T,$REG:${{ github.ref_name }}"
+          fi
+          echo "tags=$T" >> "$GITHUB_OUTPUT"
+
       - name: Build faust-edge
         uses: docker/build-push-action@v4
         with:
           context: ./edge
           file: ./edge/Dockerfile
           push: true
-          tags: ghcr.io/${{ github.repository_owner }}/openddil/faust-edge:latest
+          tags: ${{ steps.tags.outputs.tags }}
 
   # Legacy Faust detector (separate codepath from the Hero faust_edge agent
   # above). Kept building while consumers exist; not referenced by the demo
@@ -61,13 +76,23 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Compute image tags
+        id: tags
+        run: |
+          REG=ghcr.io/${{ github.repository_owner }}/openddil/edge-faust-detector
+          T="$REG:latest"
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            T="$T,$REG:${{ github.ref_name }}"
+          fi
+          echo "tags=$T" >> "$GITHUB_OUTPUT"
+
       - name: Build edge-faust-detector
         uses: docker/build-push-action@v4
         with:
           context: .
           file: ./edge/faust/Dockerfile
           push: true
-          tags: ghcr.io/${{ github.repository_owner }}/openddil/edge-faust-detector:latest
+          tags: ${{ steps.tags.outputs.tags }}
           target: production
 
   # Legacy Restate detector. Same situation as above.
@@ -87,13 +112,23 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Compute image tags
+        id: tags
+        run: |
+          REG=ghcr.io/${{ github.repository_owner }}/openddil/edge-restate-detector
+          T="$REG:latest"
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            T="$T,$REG:${{ github.ref_name }}"
+          fi
+          echo "tags=$T" >> "$GITHUB_OUTPUT"
+
       - name: Build edge-restate-detector
         uses: docker/build-push-action@v4
         with:
           context: .
           file: ./edge/restate/Dockerfile
           push: true
-          tags: ghcr.io/${{ github.repository_owner }}/openddil/edge-restate-detector:latest
+          tags: ${{ steps.tags.outputs.tags }}
           target: production
 
   # Hub-side Restate projector referenced by openddil-demo/docker-compose.yml
@@ -114,13 +149,23 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Compute image tags
+        id: tags
+        run: |
+          REG=ghcr.io/${{ github.repository_owner }}/openddil/hub-restate-projector
+          T="$REG:latest"
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            T="$T,$REG:${{ github.ref_name }}"
+          fi
+          echo "tags=$T" >> "$GITHUB_OUTPUT"
+
       - name: Build hub-restate-projector
         uses: docker/build-push-action@v4
         with:
           context: .
           file: ./hub/projector/Dockerfile
           push: true
-          tags: ghcr.io/${{ github.repository_owner }}/openddil/hub-restate-projector:latest
+          tags: ${{ steps.tags.outputs.tags }}
           target: production
 
   # Regional aggregator (Phase 6b) referenced by openddil-demo/
@@ -146,10 +191,20 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Compute image tags
+        id: tags
+        run: |
+          REG=ghcr.io/${{ github.repository_owner }}/openddil/faust-regional
+          T="$REG:latest"
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            T="$T,$REG:${{ github.ref_name }}"
+          fi
+          echo "tags=$T" >> "$GITHUB_OUTPUT"
+
       - name: Build faust-regional
         uses: docker/build-push-action@v4
         with:
           context: ./regional
           file: ./regional/Dockerfile
           push: true
-          tags: ghcr.io/${{ github.repository_owner }}/openddil/faust-regional:latest
+          tags: ${{ steps.tags.outputs.tags }}
