@@ -15,6 +15,18 @@ The integer values of each enum are stable and well-known; we keep the
 mapping in this file rather than importing the proto modules to keep
 the severity rule independent of proto regeneration timing (the rule
 predates and outlasts any individual proto change).
+
+2026-07-14: CM-status contribution capped at DEGRADED per ADR-0026 (CM
+and operational state are orthogonal axes). Previously CM_NMC mapped to
+non_operational and CM_MAJOR mapped to critical, which combined with
+worse_bucket() to drag a functionally-green asset into the operational
+non_operational / critical fleet-summary counts based purely on records
+compliance. Same class of violation the fusion _eval_cm_state fix
+addresses at the maintainer tier; this fix restores ADR-0026 consistency
+at the regional tier so maintainer / regional / HQ agree about the
+same asset. Lifecycle mappings unchanged: DECOMMISSIONED is genuinely
+non-operational (asset retired from service, not a CM records claim);
+STALE is genuinely degraded (observability gap).
 """
 from __future__ import annotations
 
@@ -61,14 +73,22 @@ def bucket_from_logistics_severity(severity: int) -> Bucket:
 
 
 def bucket_from_cm_state(overall_status: int, lifecycle: int) -> Bucket:
-    # Lifecycle dominates when an asset is decommissioned — that's a
-    # NON_OPERATIONAL state regardless of overall_status.
+    # Lifecycle DECOMMISSIONED still dominates -- a decommissioned asset
+    # is genuinely non-operational (retired from service, not a records
+    # claim). Lifecycle STALE stays at degraded (observability gap).
+    #
+    # ADR-0026: CM overall_status contribution capped at DEGRADED. Both
+    # CM_NMC and CM_MAJOR now emit degraded so a CM-only failure on a
+    # functionally-green asset never lands in critical / non_operational
+    # buckets via this path. The disagreement between CM and operational
+    # posture stays visible via the ConstrainingFactor list on the
+    # per-asset drill-in; the rollup counts reflect functional severity.
     if lifecycle == _LC_DECOMMISSIONED:
         return "non_operational"
     if overall_status == _CM_NMC:
-        return "non_operational"
+        return "degraded"
     if overall_status == _CM_MAJOR:
-        return "critical"
+        return "degraded"
     if overall_status == _CM_MINOR or lifecycle == _LC_STALE:
         return "degraded"
     return "nominal"
