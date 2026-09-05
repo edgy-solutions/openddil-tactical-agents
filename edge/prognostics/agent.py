@@ -175,6 +175,27 @@ def _build_derived_event(
     out.provenance.region_id = (
         src.provenance.region_id or _os.getenv("OPENDDIL_REGION_ID", "region-01")
     )
+    # Releasability labels (ADR-0029 §3). PURE PASSTHROUGH, and unlike
+    # edge_id above there is NO ENV FALLBACK: the derivation engine has no
+    # releasability declaration and must never acquire one. A derived
+    # sustainment event is exactly as national as the telemetry it was
+    # derived from, and if the source was unlabelled the derived event must
+    # be too, so the §7 completeness gate can see it.
+    #
+    # THIS FUNCTION BUILDS A NEW MESSAGE FIELD BY FIELD, which is why this
+    # line is needed at all. Anything not named here is dropped, silently,
+    # and the drop is invisible at the seam: fusion's inbound event simply
+    # has no label and fusion cannot tell "the source had none" from "a hop
+    # lost it". Third instance of this shape in one night — cm-service's
+    # _dict_to_record and its _recompute preservation block are the others.
+    #
+    # Found by running the pipeline, not by reading it: derived-sustainment
+    # is fusion's HIGHEST-VOLUME inbound path, and asset_logistics_status sat
+    # fully unlabelled while telemetry_latest_state and asset_cm_state were
+    # already complete. Nothing errored. The propagation graph had one more
+    # producer in it than the plan named.
+    out.provenance.originator_nation = src.provenance.originator_nation
+    out.provenance.releasable_to.extend(src.provenance.releasable_to)
     return out
 
 
