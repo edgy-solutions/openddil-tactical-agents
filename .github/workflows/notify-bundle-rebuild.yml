@@ -15,12 +15,55 @@ name: Notify openddil-helm to rebuild runtime-bundle
 #   3. openddil-helm's build-bundle.yml already listens on
 #      `repository_dispatch: types: [source-repo-changed]`.
 
+# ---------------------------------------------------------------------------
+# WHY THIS IS A DENY-LIST AND NOT AN ALLOW-LIST  (changed 2026-09-05, VE-9)
+# ---------------------------------------------------------------------------
+# It used to name the subtrees the bundle carries. That list and the bundle
+# Dockerfile's `COPY` lines were two copies of one fact, in two repositories,
+# with nothing comparing them — and they disagreed, repeatedly:
+#
+#   * `policy/` and `gateway/` were added to the bundle and not here. The
+#     edit committed, CI went green, the pod restarted, and the OLD POLICY
+#     KEPT RUNNING. No error appeared anywhere in that sequence, and it
+#     presented as the authorizer rejecting every request rather than as a
+#     stale artifact.
+#   * `ontology/` had the identical gap, masked by luck — its first change
+#     happened to share a commit with a watched path.
+#   * `contracts/baselines` and `contracts/bootstrap` were copied into the
+#     bundle and named in NO filter at all. Found by reading the Dockerfile
+#     against all four filters rather than by anything failing.
+#   * In the other direction, openddil-demo's list still named four files
+#     the bundle stopped carrying under GD-09 — so that list was
+#     simultaneously incomplete AND over-broad, while reading as
+#     authoritative. Drift in both directions at once.
+#
+# THE TWO FAILURE MODES ARE NOT SYMMETRIC, AND THAT IS THE WHOLE ARGUMENT.
+# A missed rebuild ships stale content silently, for an unbounded time, with
+# every individual fact along the way still true (green CI, successful
+# upgrade, Ready pod, current digest for the tag). An unnecessary rebuild
+# costs about a minute of CI and is idempotent.
+#
+# So the filter now fails TOWARD rebuilding. Only documentation and tests are
+# excluded — paths that cannot plausibly become bundle content. Everything
+# else triggers, including paths added tomorrow by someone who has never read
+# this file.
+#
+# Note what that changes about who must remember. An allow-list had to be
+# updated by whoever added a bundle path — IN A DIFFERENT REPOSITORY FROM THE
+# ONE THEY WERE EDITING. That is the coordination that failed twice. A
+# deny-list has to be updated by whoever adds a large non-bundle directory,
+# and forgetting costs a build.
+#
+# `paths` and `paths-ignore` are mutually exclusive in one trigger; this uses
+# `paths-ignore` deliberately and must not grow a `paths` sibling.
+
 on:
   push:
     branches: [ "master" ]
-    paths:
-      - "hub/restate_hub.py"
-      - ".github/workflows/notify-bundle-rebuild.yml"
+    paths-ignore:
+      - "docs/**"
+      - "tests/**"
+      - "**.md"
   workflow_dispatch:
 
 jobs:
