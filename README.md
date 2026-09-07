@@ -64,3 +64,37 @@ been there the whole time; adding the second Table just made it visible.
 Both current Tables (`asset_state` in `edge/faust_edge.py` and
 `prognostics_accumulators` in `edge/prognostics/agent.py`) point back to
 this section in their inline comments.
+
+## Changelog lag is NOT table-recovery state (READ BEFORE FILING A BUG)
+
+`rpk group describe openddil-<edge>` lists this app's changelog topics with
+`CURRENT-OFFSET -` and a lag equal to the whole log — millions of records:
+
+```
+openddil-edge-01-asset_state-changelog               -   3656567  365656
+openddil-edge-01-prognostics_accumulators-changelog  -   3656566  365656
+```
+
+**That is normal and means nothing about whether Tables recovered.** Faust
+rebuilds a Table from its changelog through a separate recovery path that
+does not commit offsets on the app's consumer group, so the group's view of
+those partitions stays at "never consumed" no matter how healthy recovery
+was.
+
+**Read as a defect on 2026-09-07**, and it was wrong in a costly direction:
+a fleet-wide accumulator reset was inferred from it, a fix was scheduled,
+and the actual defect elsewhere went unexamined for another round. The
+measurement that settled it was decoding the wire:
+
+```
+engine=658.12h   track=1918.39km ... 40838.83km    # across a restart
+```
+
+Accumulated service life was intact. There was nothing to repair.
+
+**How to actually check whether a Table survived a restart:** read a value
+that depends on accumulated state — decode a `derived-sustainment` message
+and compare `hours_in_service` before and after — rather than reading a lag
+number. A lag is a fact about a consumer group's offsets; table recovery is
+a fact about a table. They are different facts and only one of them answers
+the question.
