@@ -386,11 +386,28 @@ def _releasability_intersection(snapshot) -> list:
     """
     acc = None
     for _asset_id, state in snapshot:
+        # EFFECTIVE AUDIENCE, not `releasable_to` alone. The PEP predicate is
+        # a disjunction, so a contributor is visible to its OWN originator
+        # nation as well as to everyone it was released to:
+        #
+        #     effective(asset) = {originator_nation} u releasable_to
+        #
+        # Intersecting the bare `releasable_to` sets instead was wrong in a
+        # way only the data showed: this fleet is 14 of 14 labelled with
+        # releasable_to sets of `{}` and `{BDR}` -- a declared nation with no
+        # onward release is the ordinary coalition posture -- so the naive
+        # intersection came out EMPTY and made the rollups invisible even to
+        # the nation entitled to every single contributor. Correct floors
+        # deny people who should not see; that one denied the one audience
+        # that should.
         theirs = set(getattr(state, "releasable_to", None) or [])
+        nation = getattr(state, "originator_nation", "") or ""
+        if nation:
+            theirs.add(nation)
         acc = theirs if acc is None else (acc & theirs)
         if not acc:
-            # Short-circuit: empty stays empty, and there is no contributor
-            # that can widen it again.
+            # Short-circuit: empty stays empty, and no later contributor can
+            # widen it again.
             return []
     return sorted(acc or [])
 
