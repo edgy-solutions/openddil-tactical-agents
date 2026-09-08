@@ -92,6 +92,11 @@ class AssetState(faust.Record, serializer="json"):
     sustainment_wear: dict = {}
     last_updated_ns: int = 0
     last_source_edge_id: str = ""
+    # ADR-0029 releasability, carried per contributor so a rollup can be
+    # composed from them. Defaults are the UNLABELLED state, and unlabelled
+    # is not "releasable to everyone" -- see _releasability_intersection.
+    originator_nation: str = ""
+    releasable_to: list = []
 
 
 def make_aggregator_app(
@@ -210,6 +215,7 @@ async def _apply_logistics_status(env, assets_latest) -> None:
     ]
     state.last_updated_ns = int(time.time() * 1_000_000_000)
     state.last_source_edge_id = env.source_edge_id or ""
+    _carry_labels(state, upd.provenance)
     assets_latest[asset_id] = state
 
 
@@ -230,6 +236,7 @@ async def _apply_derived_sustainment(env, assets_latest) -> None:
     state.sustainment_wear = wear
     state.last_updated_ns = int(time.time() * 1_000_000_000)
     state.last_source_edge_id = env.source_edge_id or ""
+    _carry_labels(state, upd.provenance)
     assets_latest[asset_id] = state
 
 
@@ -242,6 +249,11 @@ async def _apply_cm_state(envelope_json: dict, assets_latest) -> None:
     state.cm_lifecycle = int(envelope_json.get("lifecycle") or 0)
     state.last_updated_ns = int(time.time() * 1_000_000_000)
     state.last_source_edge_id = envelope_json.get("edge_id") or state.last_source_edge_id
+    prov = envelope_json.get("provenance") or {}
+    if prov.get("originator_nation"):
+        state.originator_nation = str(prov["originator_nation"])
+    if prov.get("releasable_to"):
+        state.releasable_to = [str(x) for x in prov["releasable_to"]]
     assets_latest[asset_id] = state
 
 
@@ -268,6 +280,11 @@ async def _emit_rollups(
     now_ts = Timestamp()
     now_ts.FromNanoseconds(now_ns)
 
+    # Computed ONCE over the same snapshot the counts are computed from. If
+    # it were recomputed per rollup the three could disagree about who may
+    # see a number they all derive from the same assets.
+    releasable = _releasability_intersection(snapshot)
+
     # ---- fleet summary -----------------------------------------------------
     counts = {"nominal": 0, "degraded": 0, "critical": 0, "non_operational": 0}
     for _asset_id, state in snapshot:
@@ -284,7 +301,7 @@ async def _emit_rollups(
         asset_count=sum(counts.values()),
     )
     fs_msg.observed_at.CopyFrom(now_ts)
-    _stamp_provenance(fs_msg.provenance, region_id, now_ts)
+    _stamp_provenance(fs_msg.provenance, region_id, now_ts, releasable)
     await out_fleet_summary.send(key=region_id, value=fs_msg.SerializeToString())
 
     # ---- top factors -------------------------------------------------------
@@ -313,7 +330,7 @@ async def _emit_rollups(
             for sev_name, c in entry["severity_breakdown"].items():
                 fc.severity_breakdown[sev_name] = c
         tf_msg.observed_at.CopyFrom(now_ts)
-        _stamp_provenance(tf_msg.provenance, region_id, now_ts)
+        _stamp_provenance(tf_msg.provenance, region_id, now_ts, releasable)
         await out_top_factors.send(key=region_id, value=tf_msg.SerializeToString())
 
     # ---- wear trends -------------------------------------------------------
@@ -336,12 +353,74 @@ async def _emit_rollups(
             cw.mean_rul_remaining = sum(ruls) / len(ruls)
             cw.asset_count = len(ruls)
         wt_msg.observed_at.CopyFrom(now_ts)
-        _stamp_provenance(wt_msg.provenance, region_id, now_ts)
+        _stamp_provenance(wt_msg.provenance, region_id, now_ts, releasable)
         await out_wear_trends.send(key=region_id, value=wt_msg.SerializeToString())
 
 
-def _stamp_provenance(provenance, region_id: str, now_ts: Timestamp) -> None:
+def _carry_labels(state, provenance) -> None:
+    """Copy a contributor's releasability onto its AssetState, if it has any."""
+    if getattr(provenance, "originator_nation", ""):
+        state.originator_nation = provenance.originator_nation
+    if getattr(provenance, "releasable_to", None):
+        state.releasable_to = list(provenance.releasable_to)
+
+
+def _releasability_intersection(snapshot) -> list:
+    """The INTERSECTION of every contributor's releasability. Never the union.
+
+    A rollup is one number standing for many assets, so a viewer who can see
+    the number has learned something about every asset that moved it -- and a
+    HIDDEN ROW STILL MOVED THE NUMBER. Union would therefore leak: it would
+    show the aggregate to anyone entitled to ANY contributor, including
+    contributors they may not see individually. Intersection is the floor,
+    and its consequence is deliberate and stated: one ATL-only asset makes
+    every rollup in that region ATL-only.
+
+    AN UNLABELLED CONTRIBUTOR COLLAPSES THE SET TO EMPTY. Under deny-unlabeled
+    an unlabelled row is releasable to no one, and intersecting with no-one
+    gives no-one. That reads as harsh and is the only safe reading: the
+    alternative is to treat "we were not told" as "no restriction", which is
+    the exact inversion ADR-0029 exists to prevent. A region whose rollups go
+    dark is telling you its inputs are unlabelled, which is a true statement
+    about the deployment.
+    """
+    acc = None
+    for _asset_id, state in snapshot:
+        theirs = set(getattr(state, "releasable_to", None) or [])
+        acc = theirs if acc is None else (acc & theirs)
+        if not acc:
+            # Short-circuit: empty stays empty, and there is no contributor
+            # that can widen it again.
+            return []
+    return sorted(acc or [])
+
+
+def _stamp_provenance(provenance, region_id: str, now_ts: Timestamp,
+                      releasable_to: list | None = None) -> None:
     provenance.producer_id = "regional-aggregator"
     provenance.region_id = region_id
     provenance.ingest_time.CopyFrom(now_ts)
     provenance.classification = "U"
+
+    # ---------------------------------------------------------------------
+    # originator_nation IS DELIBERATELY NOT SET, and this is load-bearing.
+    # ---------------------------------------------------------------------
+    # The PEP's policy predicate is a DISJUNCTION:
+    #
+    #     (originator_nation IS NOT NULL AND originator_nation IN (:nations))
+    #     OR (releasable_to IS NOT NULL AND releasable_to && ARRAY[:nations])
+    #
+    # so an originator_nation alone grants access. Stamping one on a rollup
+    # -- say, the nation most contributors share -- would open that first
+    # branch and let a viewer of that nation see an aggregate computed over
+    # assets they are NOT entitled to. It would bypass the intersection
+    # completely while looking like a reasonable label.
+    #
+    # An aggregate has no originator nation. It is a product of the region,
+    # derived from many originators, and the honest thing is to claim
+    # nothing: leaving it unset closes the first branch and makes the
+    # intersected releasable_to the SOLE access decision. That is the floor
+    # holding.
+    if releasable_to is not None:
+        del provenance.releasable_to[:]
+        provenance.releasable_to.extend(releasable_to)
