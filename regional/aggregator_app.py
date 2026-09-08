@@ -94,7 +94,7 @@ class AssetState(faust.Record, serializer="json"):
     last_source_edge_id: str = ""
     # ADR-0029 releasability, carried per contributor so a rollup can be
     # composed from them. Defaults are the UNLABELLED state, and unlabelled
-    # is not "releasable to everyone" -- see _releasability_intersection.
+    # is not "releasable to everyone" -- see _partition_by_audience.
     originator_nation: str = ""
     releasable_to: list = []
 
@@ -286,10 +286,35 @@ async def _emit_rollups(
     now_ts = Timestamp()
     now_ts.FromNanoseconds(now_ns)
 
-    # Computed ONCE over the same snapshot the counts are computed from. If
-    # it were recomputed per rollup the three could disagree about who may
-    # see a number they all derive from the same assets.
-    releasable = _releasability_intersection(snapshot)
+    # ONE PARTIAL PER RELEASABILITY CLASS. Every emission below is computed
+    # over ONE class's contributors only, so no number ever contains data its
+    # audience cannot see, and each partial is an ordinary labelled row.
+    for cls, members in sorted(_partition_by_audience(snapshot).items()):
+        await _emit_class(
+            region_id=region_id,
+            cls=cls,
+            snapshot=members,
+            now_ts=now_ts,
+            out_fleet_summary=out_fleet_summary,
+            out_top_factors=out_top_factors,
+            out_wear_trends=out_wear_trends,
+        )
+
+
+async def _emit_class(
+    *,
+    region_id: str,
+    cls: str,
+    snapshot,
+    now_ts,
+    out_fleet_summary,
+    out_top_factors,
+    out_wear_trends,
+) -> None:
+    # The class IS the audience. A partial claims no originator -- its class
+    # is who may see it, not who wrote it -- so the §4 disjunction's first
+    # branch stays closed and access is decided by the class alone.
+    releasable = sorted(x for x in cls.split(",") if x)
 
     # ---- fleet summary -----------------------------------------------------
     counts = {"nominal": 0, "degraded": 0, "critical": 0, "non_operational": 0}
@@ -308,7 +333,7 @@ async def _emit_rollups(
     )
     fs_msg.observed_at.CopyFrom(now_ts)
     _stamp_provenance(fs_msg.provenance, region_id, now_ts, releasable)
-    await out_fleet_summary.send(key=region_id, value=fs_msg.SerializeToString())
+    await out_fleet_summary.send(key=_partial_key(region_id, cls), value=fs_msg.SerializeToString())
 
     # ---- top factors -------------------------------------------------------
     factor_counts: dict[str, dict] = {}  # factor_id -> {count, severity_breakdown}
@@ -337,7 +362,7 @@ async def _emit_rollups(
                 fc.severity_breakdown[sev_name] = c
         tf_msg.observed_at.CopyFrom(now_ts)
         _stamp_provenance(tf_msg.provenance, region_id, now_ts, releasable)
-        await out_top_factors.send(key=region_id, value=tf_msg.SerializeToString())
+        await out_top_factors.send(key=_partial_key(region_id, cls), value=tf_msg.SerializeToString())
 
     # ---- wear trends -------------------------------------------------------
     # Per the mixed-unit handling rule: group by (component_id, unit).
@@ -360,7 +385,7 @@ async def _emit_rollups(
             cw.asset_count = len(ruls)
         wt_msg.observed_at.CopyFrom(now_ts)
         _stamp_provenance(wt_msg.provenance, region_id, now_ts, releasable)
-        await out_wear_trends.send(key=region_id, value=wt_msg.SerializeToString())
+        await out_wear_trends.send(key=_partial_key(region_id, cls), value=wt_msg.SerializeToString())
 
 
 def _carry_labels(state, provenance) -> None:
@@ -371,51 +396,73 @@ def _carry_labels(state, provenance) -> None:
         state.releasable_to = list(provenance.releasable_to)
 
 
-def _releasability_intersection(snapshot) -> list:
-    """The INTERSECTION of every contributor's releasability. Never the union.
+def _effective_audience(state) -> frozenset:
+    """Who may see this ONE contributor.
 
-    A rollup is one number standing for many assets, so a viewer who can see
-    the number has learned something about every asset that moved it -- and a
-    HIDDEN ROW STILL MOVED THE NUMBER. Union would therefore leak: it would
-    show the aggregate to anyone entitled to ANY contributor, including
-    contributors they may not see individually. Intersection is the floor,
-    and its consequence is deliberate and stated: one ATL-only asset makes
-    every rollup in that region ATL-only.
+    The §4 predicate is a disjunction, so a row is visible to its own
+    originator nation as well as to everyone it was released to:
 
-    AN UNLABELLED CONTRIBUTOR COLLAPSES THE SET TO EMPTY. Under deny-unlabeled
-    an unlabelled row is releasable to no one, and intersecting with no-one
-    gives no-one. That reads as harsh and is the only safe reading: the
-    alternative is to treat "we were not told" as "no restriction", which is
-    the exact inversion ADR-0029 exists to prevent. A region whose rollups go
-    dark is telling you its inputs are unlabelled, which is a true statement
-    about the deployment.
+        effective(asset) = {originator_nation} u releasable_to
+
+    Intersecting bare `releasable_to` sets ignored the first half and made
+    rollups invisible to the very nation entitled to every contributor -- a
+    floor that denied the only audience that should have passed.
     """
-    acc = None
-    for _asset_id, state in snapshot:
-        # EFFECTIVE AUDIENCE, not `releasable_to` alone. The PEP predicate is
-        # a disjunction, so a contributor is visible to its OWN originator
-        # nation as well as to everyone it was released to:
-        #
-        #     effective(asset) = {originator_nation} u releasable_to
-        #
-        # Intersecting the bare `releasable_to` sets instead was wrong in a
-        # way only the data showed: this fleet is 14 of 14 labelled with
-        # releasable_to sets of `{}` and `{BDR}` -- a declared nation with no
-        # onward release is the ordinary coalition posture -- so the naive
-        # intersection came out EMPTY and made the rollups invisible even to
-        # the nation entitled to every single contributor. Correct floors
-        # deny people who should not see; that one denied the one audience
-        # that should.
-        theirs = set(getattr(state, "releasable_to", None) or [])
-        nation = getattr(state, "originator_nation", "") or ""
-        if nation:
-            theirs.add(nation)
-        acc = theirs if acc is None else (acc & theirs)
-        if not acc:
-            # Short-circuit: empty stays empty, and no later contributor can
-            # widen it again.
-            return []
-    return sorted(acc or [])
+    out = set(getattr(state, "releasable_to", None) or [])
+    nation = getattr(state, "originator_nation", "") or ""
+    if nation:
+        out.add(nation)
+    return frozenset(out)
+
+
+def _class_key(audience: frozenset) -> str:
+    """Canonical name for an audience set: sorted, comma-joined.
+
+    So {BDR,ATL} and {ATL,BDR} are ONE class rather than two rows that would
+    both be served and double-count. The empty string is a real class -- the
+    audience of a contributor releasable to nobody -- and must stay
+    expressible rather than collapse into "no class".
+    """
+    return ",".join(sorted(audience))
+
+
+def _partial_key(region_id: str, cls: str) -> str:
+    """Kafka key for one partial.
+
+    MUST include the class. These are COMPACTED topics keyed for upsert, so
+    keying every partial on region_id alone would have the three partials
+    overwrite one another and leave whichever emitted last standing as if it
+    were the whole region -- a wrong number that looks like a right one, and
+    the exact failure the partition exists to prevent.
+    """
+    return region_id + "|" + cls
+
+
+def _partition_by_audience(snapshot) -> dict:
+    """Group contributors into equivalence classes of effective audience.
+
+    WHY PARTITION RATHER THAN INTERSECT. One row per region cannot express
+    the right access rule. Measured on region-east: fourteen contributors in
+    three classes -- {ATL} x7, {BDR} x6, {ATL,BDR} x1 -- whose intersection is
+    EMPTY, so the single composed row was releasable to nobody, the liaison
+    included, despite the liaison being entitled to all fourteen.
+
+    The floor was not wrong; it was the correct minimum for one row, and it
+    showed that one row is the wrong shape. The right rule is "the subject
+    may see every input", a PER-CONTRIBUTOR test that no single releasable_to
+    set encodes under overlap semantics: the empty set denies everyone, the
+    union leaks to everyone, and nothing between them is honest.
+
+    So each class becomes an ORDINARY LABELLED ROW whose releasable_to IS its
+    class. The overlap predicate then works unchanged, with no
+    aggregate-specific access logic anywhere -- the trade is more rows, every
+    one of them ordinary.
+    """
+    buckets: dict = {}
+    for asset_id, state in snapshot:
+        buckets.setdefault(_class_key(_effective_audience(state)), []).append(
+            (asset_id, state))
+    return buckets
 
 
 def _stamp_provenance(provenance, region_id: str, now_ts: Timestamp,
