@@ -236,7 +236,13 @@ async def _apply_derived_sustainment(env, assets_latest) -> None:
     state.sustainment_wear = wear
     state.last_updated_ns = int(time.time() * 1_000_000_000)
     state.last_source_edge_id = env.source_edge_id or ""
-    _carry_labels(state, upd.provenance)
+    # `ete`, not `upd`: this handler's payload is the telemetry event, and a
+    # careless global replace put the logistics handler's variable name here.
+    # Both functions end with identical lines, str.replace has no count by
+    # default, and the result crashed the agent on every derived-sustainment
+    # event -- silently from the outside, since the pod stayed 1/1 Running and
+    # only the emission stopped.
+    _carry_labels(state, ete.provenance)
     assets_latest[asset_id] = state
 
 
