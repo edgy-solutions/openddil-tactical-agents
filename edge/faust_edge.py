@@ -152,6 +152,30 @@ def _emit_window_for_asset(evt: pb.EntityTelemetryEvent,
     out.provenance.ingest_time.FromNanoseconds(now_ns)
     out.provenance.classification = "U"
 
+    # ADR-0029 §3: PROPAGATE, do not derive. A window is a rollup of ONE
+    # asset's own samples, so it inherits that asset's labels whole -- this
+    # is not the aggregate case the regional aggregator handles, where rows
+    # from several authors are combined and no one of them may claim
+    # authorship of the result. Here there is exactly one author and it is
+    # the same author as the source event.
+    #
+    # WITHOUT THIS COPY the windowed path is lossy, and lossy in the
+    # direction that reads as correct: an asset reaching fusion only through
+    # `asset-telemetry-windows` would arrive unlabelled and be refused at
+    # the egress gate as `unlabelled` -- indistinguishable from an asset
+    # nobody declared, with the fix appearing to belong at an ingress that
+    # had in fact done its job. It did not bite because raw-sensor-stream is
+    # also a direct fusion input and fusion's stored label is sticky, so one
+    # labelled inbound was enough to mask it.
+    #
+    # No else-branch and no default. An unlabelled source event produces an
+    # unlabelled window, which the gate then refuses; inventing a value here
+    # would hide the thing the gate exists to surface.
+    if evt.provenance.originator_nation:
+        out.provenance.originator_nation = evt.provenance.originator_nation
+    if evt.provenance.releasable_to:
+        out.provenance.releasable_to.extend(evt.provenance.releasable_to)
+
     total_samples = 0
     window_min_start: int | None = None
 
