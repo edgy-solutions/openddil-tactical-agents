@@ -54,6 +54,7 @@ from openddil.regional.v1 import (
     region_top_factors_pb2 as tf_pb,
     region_wear_trends_pb2 as wt_pb,
 )
+from openddil.telemetry.v1 import telemetry_pb2 as tpb
 
 from severity import (
     bucket_from_cm_state,
@@ -67,6 +68,18 @@ log = logging.getLogger("faust_regional.aggregator")
 _LOGISTICS_SEVERITY_NAME = {
     0: "UNSPECIFIED", 1: "OK", 2: "DEGRADED", 3: "CRITICAL",
     4: "NON_OPERATIONAL",
+}
+
+# ADR-0044 §3. proto enum (OperationalStatus, telemetry.proto) -> the
+# AssetState.operational_status column string, same strings projector's
+# lifecycle_status.py uses. Only these three are ever written here — the
+# source App has already dropped everything else (OPERATIONAL, UNSPECIFIED,
+# field-absent) before an envelope reaches this aggregator at all; this
+# dict is the defensive mirror of that filter, not the primary one.
+_OPERATIONAL_STATUS_COLUMN = {
+    tpb.OPERATIONAL_STATUS_DESTROYED: "destroyed",
+    tpb.OPERATIONAL_STATUS_DEACTIVATED: "deactivated",
+    tpb.OPERATIONAL_STATUS_REMOVED: "removed",
 }
 
 _TOP_FACTORS_N = int(os.getenv("REGIONAL_TOP_FACTORS_N", "10"))
@@ -92,6 +105,13 @@ class AssetState(faust.Record, serializer="json"):
     sustainment_wear: dict = {}
     last_updated_ns: int = 0
     last_source_edge_id: str = ""
+    # ADR-0044 §3. "" (never set), "destroyed", "deactivated" or "removed" --
+    # the same strings as projector lifecycle_status.py. Set ONLY by an
+    # operational_claim (see _apply_operational_claim); no other handler in
+    # this module may write it. Sticky: once set, never cleared by absence
+    # or by any other input -- only a later terminal claim overwrites it
+    # (destroyed -> removed is legal).
+    operational_status: str = ""
     # ADR-0029 releasability, carried per contributor so a rollup can be
     # composed from them. Defaults are the UNLABELLED state, and unlabelled
     # is not "releasable to everyone" -- see _partition_by_audience.
@@ -199,6 +219,8 @@ async def _dispatch_envelope(
         except Exception:
             return
         await _apply_cm_state(envelope_json, assets_latest)
+    elif payload == "operational_claim":
+        await _apply_operational_claim(env, assets_latest)
 
 
 async def _apply_logistics_status(env, assets_latest) -> None:
@@ -242,6 +264,33 @@ async def _apply_derived_sustainment(env, assets_latest) -> None:
     # default, and the result crashed the agent on every derived-sustainment
     # event -- silently from the outside, since the pod stayed 1/1 Running and
     # only the emission stopped.
+    _carry_labels(state, ete.provenance)
+    assets_latest[asset_id] = state
+
+
+async def _apply_operational_claim(env, assets_latest) -> None:
+    """ADR-0044 §3. The source App has already filtered to a genuine
+    terminal claim before this envelope was ever produced -- the dict
+    lookup below is a defensive mirror of that filter, not the primary
+    one. `state.operational_status` is otherwise untouched by every other
+    _apply_* function in this module, which is what makes it sticky: an
+    asset's terminal status survives any number of later logistics/
+    cm-state/sustainment updates for the same asset_id, and moves only
+    when another operational_claim arrives (destroyed -> removed is a
+    legal, ordinary overwrite -- there is no "undo" direction, a terminal
+    claim is never reversed back to "" by this function).
+    """
+    ete = env.operational_claim
+    asset_id = ete.asset.asset_id or env.asset_id or ""
+    if not asset_id:
+        return
+    status = _OPERATIONAL_STATUS_COLUMN.get(ete.operational_state.operational_status)
+    if status is None:
+        return
+    state = assets_latest[asset_id]
+    state.operational_status = status
+    state.last_updated_ns = int(time.time() * 1_000_000_000)
+    state.last_source_edge_id = env.source_edge_id or ""
     _carry_labels(state, ete.provenance)
     assets_latest[asset_id] = state
 
@@ -317,8 +366,19 @@ async def _emit_class(
     releasable = sorted(x for x in cls.split(",") if x)
 
     # ---- fleet summary -----------------------------------------------------
-    counts = {"nominal": 0, "degraded": 0, "critical": 0, "non_operational": 0}
+    # ADR-0044 §3: an asset with a terminal operational_status is counted in
+    # its own destroyed/deactivated/removed column and NOT in a severity
+    # bucket -- the claim made once at the edge (sim-dis-mapping.yaml:306)
+    # is adopted here, never re-derived from logistics/cm-state. asset_count
+    # is the whole partition: buckets + the three terminal counters.
+    counts = {
+        "nominal": 0, "degraded": 0, "critical": 0, "non_operational": 0,
+        "destroyed": 0, "deactivated": 0, "removed": 0,
+    }
     for _asset_id, state in snapshot:
+        if state.operational_status:
+            counts[state.operational_status] = counts[state.operational_status] + 1
+            continue
         logistics_bucket = bucket_from_logistics_severity(state.logistics_severity)
         cm_bucket = bucket_from_cm_state(state.cm_overall_status, state.cm_lifecycle)
         bucket = worse_bucket(logistics_bucket, cm_bucket)
@@ -329,6 +389,9 @@ async def _emit_class(
         degraded=counts["degraded"],
         critical=counts["critical"],
         non_operational=counts["non_operational"],
+        destroyed=counts["destroyed"],
+        deactivated=counts["deactivated"],
+        removed=counts["removed"],
         asset_count=sum(counts.values()),
     )
     fs_msg.observed_at.CopyFrom(now_ts)

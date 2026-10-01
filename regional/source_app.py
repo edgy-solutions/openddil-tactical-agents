@@ -56,9 +56,24 @@ log = logging.getLogger("faust_regional.source")
 #   - derived-sustainment (faust-edge prognostics produces here)
 #   - asset-telemetry-windows (faust-edge windowing produces here; wired
 #     but DEBUG no-op in aggregator per §B asymmetric coverage)
+#   - telemetry-latest-state (sensor-ingest / DIS mapping produce here;
+#     ADR-0044 §3 — filtered to terminal operational-status claims only,
+#     see _wrap_and_forward_operational_claim below)
 # A per-edge subscription on asset-logistics-status would consume nothing
 # (fusion produces only to hq); dropping it avoids the spurious lag-zero
 # consumer group on every edge broker.
+
+# ADR-0044 §3: the only operational_status values that are a terminal
+# signal for this column. OPERATIONAL and UNSPECIFIED are not signals for
+# this column (a status is changed only by a signal, ADR-0044 §2) — every
+# other value, including the field being entirely absent (proto3 default
+# 0 == UNSPECIFIED), is dropped here at the source so nothing but a
+# genuine terminal claim ever reaches the fan-in topic / aggregator.
+_TERMINAL_OPERATIONAL_STATUSES = frozenset({
+    tpb.OPERATIONAL_STATUS_DESTROYED,
+    tpb.OPERATIONAL_STATUS_DEACTIVATED,
+    tpb.OPERATIONAL_STATUS_REMOVED,
+})
 
 
 def make_source_app(
@@ -106,6 +121,14 @@ def make_source_app(
     async def on_asset_telemetry_windows(stream):
         async for raw in stream:
             await _wrap_and_forward_windowed_telemetry(
+                raw=raw, edge_id=edge_id, region_id=region_id,
+                fan_in_topic=fan_in_topic, producer=hq_producer,
+            )
+
+    @app.agent(app.topic("telemetry-latest-state", value_type=bytes))
+    async def on_telemetry_latest_state(stream):
+        async for raw in stream:
+            await _wrap_and_forward_operational_claim(
                 raw=raw, edge_id=edge_id, region_id=region_id,
                 fan_in_topic=fan_in_topic, producer=hq_producer,
             )
@@ -186,6 +209,40 @@ async def _wrap_and_forward_windowed_telemetry(
         wrapped_at=_now_timestamp(), asset_id=asset_id,
     )
     env.asset_telemetry_windows.CopyFrom(wt)
+    await producer.send(fan_in_topic, key=asset_id, value=env.SerializeToString())
+
+
+async def _wrap_and_forward_operational_claim(
+    *, raw: bytes, edge_id: str, region_id: str,
+    fan_in_topic: str, producer: "_HqProducerService",
+) -> None:
+    """ADR-0044 §3. telemetry-latest-state carries EVERY asset update, not
+    just terminal ones — unlike derived_sustainment/windowed_telemetry's
+    topics, this one would flood the fan-in with a record for every
+    ordinary sample if forwarded unconditionally. Stateless filter-and-wrap:
+    only a genuine terminal operational_status claim (DESTROYED/DEACTIVATED/
+    REMOVED) is wrapped and forwarded; everything else — OPERATIONAL,
+    UNSPECIFIED, or the field absent entirely — is dropped right here, at
+    the source. Silence and OPERATIONAL are not signals for this column
+    (ADR-0044 §2), so they must never even reach the aggregator's Table.
+    """
+    if not raw:
+        return
+    ete = tpb.EntityTelemetryEvent()
+    try:
+        ete.ParseFromString(raw)
+    except Exception as exc:
+        log.warning("%s: bad telemetry-latest-state EntityTelemetryEvent (len=%d): %s",
+                    edge_id, len(raw), exc)
+        return
+    if ete.operational_state.operational_status not in _TERMINAL_OPERATIONAL_STATUSES:
+        return
+    asset_id = ete.asset.asset_id or ""
+    env = inp_pb.RegionalAggregatorInput(
+        source_edge_id=edge_id, region_id=region_id,
+        wrapped_at=_now_timestamp(), asset_id=asset_id,
+    )
+    env.operational_claim.CopyFrom(ete)
     await producer.send(fan_in_topic, key=asset_id, value=env.SerializeToString())
 
 
