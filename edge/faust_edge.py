@@ -19,9 +19,11 @@ DEPLOYMENT NOTE:
 - Development: Uses `docker-compose.override.yml` to build from source and
                mount local code for hot-reloading.
 """
+import logging
 import os
 import time
 from collections import deque
+from typing import Optional
 
 import faust
 from openddil.telemetry.v1 import telemetry_pb2 as pb
@@ -35,6 +37,12 @@ from detection.windows import (
     proto_to_pint,
     trend_to_proto,
 )
+# ADR-0044 amendment ("posture, a third column") -- a pure sibling module,
+# no Faust/proto types (same boundary discipline as detection/algorithms.py).
+# Aliased so the StateRecord field named `posture` below never shadows it.
+import posture as posture_mod
+
+logger = logging.getLogger(__name__)
 # Phase 5 prognostics derivation engine — the one-line seam (ADR-0020).
 # `register(app)` below adds the engine's own agent + Table; this is the
 # *only* coupling. To extract the engine into its own service later,
@@ -54,6 +62,63 @@ KAFKA_BROKERS = os.getenv("KAFKA_BROKERS", "redpanda-edge:9092")
 # inherit a populated field rather than having to backfill it then.
 OPENDDIL_EDGE_ID   = os.getenv("OPENDDIL_EDGE_ID",   "edge-01")
 OPENDDIL_REGION_ID = os.getenv("OPENDDIL_REGION_ID", "region-01")
+
+# ADR-0044 amendment ("posture, a third column") -- thresholds for the
+# per-asset posture state machine (edge/posture.py), env-driven per
+# the ADR-0044 amendment's declared defaults so ops can tune without a code change.
+POSTURE_MOVE_SPEED_MPS = float(os.getenv("POSTURE_MOVE_SPEED_MPS", "1.0"))
+POSTURE_MOVE_HOLD_S    = float(os.getenv("POSTURE_MOVE_HOLD_S",    "10"))
+POSTURE_STOP_HOLD_S    = float(os.getenv("POSTURE_STOP_HOLD_S",    "20"))
+POSTURE_THRESHOLDS = posture_mod.Thresholds(
+    move_speed_mps=POSTURE_MOVE_SPEED_MPS,
+    move_hold_s=POSTURE_MOVE_HOLD_S,
+    stop_hold_s=POSTURE_STOP_HOLD_S,
+)
+
+# posture.py's lower-case state names <-> the proto enum. Lower-case without
+# prefix is also the projector's on-disk representation (telemetry_latest.py),
+# so this mapping and that one must be kept in agreement.
+_POSTURE_TO_PROTO = {
+    posture_mod.UNSPECIFIED:   pb.POSTURE_STATUS_UNSPECIFIED,
+    posture_mod.EMPLACED:      pb.POSTURE_STATUS_EMPLACED,
+    posture_mod.MARCH_ORDERED: pb.POSTURE_STATUS_MARCH_ORDERED,
+    posture_mod.MOVING:        pb.POSTURE_STATUS_MOVING,
+    posture_mod.EMPLACING:     pb.POSTURE_STATUS_EMPLACING,
+}
+
+# In-memory only -- a restart or reset losing this is harmless: it only
+# widens which records get the byte-identical fast path for a short while,
+# never a correctness issue (see the emission comment in process() below).
+_launcher_ever_seen: dict[str, bool] = {}
+
+
+def _posture_inputs(evt: "pb.EntityTelemetryEvent"):
+    """Pull the state machine's three inputs out of the parsed event.
+
+    Returns (launcher_raised, speed, now):
+      - launcher_raised: True/False if the field was set, else None (this
+        platform's domain has no launcher bit at all -- HasField, not a
+        truthiness check, so an explicit False is never confused with unset).
+      - speed: |velocity| in m/s, computed from kinematics.velocity.ecef
+        only (ground_speed is a separate, never-populated-for-DIS field --
+        see the ADR-0044 amendment). None if no ecef velocity was sent.
+      - now: provenance.sample_time as epoch seconds (the record's OWN event
+        time, not wall clock, so replay stays deterministic).
+    """
+    launcher_raised = (
+        evt.operational_state.launcher_raised
+        if evt.operational_state.HasField("launcher_raised")
+        else None
+    )
+    vel = evt.kinematics.velocity
+    if vel.WhichOneof("frame") == "ecef":
+        v = vel.ecef
+        speed = (v.x * v.x + v.y * v.y + v.z * v.z) ** 0.5
+    else:
+        speed = None
+    ts = evt.provenance.sample_time
+    now = ts.seconds + ts.nanos / 1e9
+    return launcher_raised, speed, now
 
 app = faust.App(
     FAUST_APP_ID,
@@ -82,6 +147,15 @@ class StateRecord(faust.Record):
     last_temp_k: float = 0.0
     temp_ewma_k: float = 0.0
     temp_ewma_alpha: float = 0.2
+    # ADR-0044 amendment ("posture, a third column"). Defaults so a
+    # changelog record written before this field existed still loads --
+    # as a cold start, same as a genuinely new asset. A reset trims the
+    # changelog outright, so after a reset every asset cold-starts
+    # unspecified too; same externally-visible result, different cause.
+    posture: str = posture_mod.UNSPECIFIED
+    posture_since: Optional[float] = None
+    motion: str = ""
+    motion_since: Optional[float] = None
 
 asset_state = app.Table(
     "asset_state",
@@ -290,18 +364,70 @@ async def process(stream):
         try:
             evt.ParseFromString(raw)
         except Exception as e:
-            import logging
             logging.error(f"Failed to parse protobuf: {e}")
             continue
 
-        # 1. Forward to latest-state (preserving original bytes)
-        await state_topic.send(key=evt.asset.asset_id, value=raw)
+        aid = evt.asset.asset_id
+
+        # Load state once per record -- carries both the anomaly-detection
+        # rolling state (below) and the posture state machine's state
+        # (ADR-0044 amendment), read and written together.
+        rec = asset_state[aid]
+
+        # 0. Posture state machine (ADR-0044 amendment, "posture, a third
+        # column"). Decided ONCE, here, at the owning (edge) tier; every
+        # other tier (projector, store) only carries what we decide here,
+        # never re-derives it.
+        launcher_raised, speed, posture_now = _posture_inputs(evt)
+        if launcher_raised is not None:
+            _launcher_ever_seen[aid] = True
+        prev_posture_state = posture_mod.PostureState(
+            posture=rec.posture,
+            posture_since=rec.posture_since,
+            motion=rec.motion,
+            motion_since=rec.motion_since,
+        )
+        new_posture_state = posture_mod.step(
+            prev_posture_state, launcher_raised, speed, posture_now, POSTURE_THRESHOLDS
+        )
+        if new_posture_state.posture != prev_posture_state.posture:
+            logger.info("posture transition %s", {
+                "posture": aid,
+                "from": prev_posture_state.posture,
+                "to": new_posture_state.posture,
+                "at": posture_now,
+            })
+        rec.posture = new_posture_state.posture
+        rec.posture_since = new_posture_state.posture_since
+        rec.motion = new_posture_state.motion
+        rec.motion_since = new_posture_state.motion_since
+
+        # 1. Forward to latest-state. Byte-identical to today UNLESS this
+        # asset's posture is anything but unspecified, OR it has ever
+        # carried a launcher_raised signal at all (even a steady False) --
+        # so traffic that never touches posture (no DIS appearance, or a
+        # domain with no launcher bit at all) stays byte-identical on the
+        # wire, exactly as it was before this feature existed.
+        posture_untouched = (
+            new_posture_state.posture == posture_mod.UNSPECIFIED
+            and not _launcher_ever_seen.get(aid, False)
+        )
+        if posture_untouched:
+            await state_topic.send(key=aid, value=raw)
+        else:
+            if new_posture_state.posture == posture_mod.UNSPECIFIED:
+                evt.operational_state.ClearField("posture_since")
+            else:
+                evt.operational_state.posture_since.FromNanoseconds(
+                    int(round(new_posture_state.posture_since * 1e9))
+                )
+            evt.operational_state.posture_status = _POSTURE_TO_PROTO[new_posture_state.posture]
+            await state_topic.send(key=aid, value=evt.SerializeToString())
 
         # 1a. Windowing — buffer this sample and (every N samples) emit a
         # WindowedTelemetry for the logistics fusion service.
         now_ns = int(time.time() * 1e9)
         _buffer_event(evt, now_ns)
-        aid = evt.asset.asset_id
         if aid:
             samples_since_last_emit[aid] = samples_since_last_emit.get(aid, 0) + 1
             if samples_since_last_emit[aid] >= EMIT_EVERY_N_SAMPLES:
@@ -315,9 +441,9 @@ async def process(stream):
 
         # 2. Anomaly Detection Pipeline
         view = _build_view(evt)
-        
-        # Load state from Table (StateRecord) -> Convert to Algo State (AssetState)
-        rec = asset_state[view.asset_id]
+
+        # rec was already loaded above (shared with the posture state
+        # machine) -> Convert to Algo State (AssetState)
         st = AssetState(
             last_temp_k=rec.last_temp_k,
             temp_ewma_k=rec.temp_ewma_k,
@@ -355,11 +481,13 @@ async def process(stream):
                     value=json.dumps(ce).encode('utf-8')
                 )
 
-        # Sync back to Table (AssetState -> StateRecord)
+        # Sync back to Table. One write carrying both the anomaly-detection
+        # state (AssetState -> StateRecord) and the posture fields already
+        # set on `rec` above -- one read, one write, per record.
         rec.last_temp_k = st.last_temp_k or 0.0
         rec.temp_ewma_k = st.temp_ewma_k or 0.0
         rec.temp_ewma_alpha = st.temp_ewma_alpha
-        asset_state[view.asset_id] = rec
+        asset_state[aid] = rec
 
 register_prognostics(app)
 
