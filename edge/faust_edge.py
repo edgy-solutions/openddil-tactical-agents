@@ -392,7 +392,7 @@ async def process(stream):
         )
         if new_posture_state.posture != prev_posture_state.posture:
             logger.info("posture transition %s", {
-                "posture": aid,
+                "asset": aid,
                 "from": prev_posture_state.posture,
                 "to": new_posture_state.posture,
                 "at": posture_now,
