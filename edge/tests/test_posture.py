@@ -127,7 +127,7 @@ def test_power_plant_is_not_a_gate():
 
 
 # ---------------------------------------------------------------------------
-# Red-check 1: entity with only "0 stow", stationary -- stays unspecified
+# Negative case: entity with only "0 stow", stationary -- stays unspecified
 # ---------------------------------------------------------------------------
 
 def test_only_stow_stays_unspecified_whole_run():
@@ -190,7 +190,7 @@ def test_fixture_replay_default_thresholds_matches_predictions():
 
 
 # ---------------------------------------------------------------------------
-# Red-check 2: POSTURE_STOP_HOLD_S=60 -- A goes moving at ~70, no emplacing,
+# Negative case: POSTURE_STOP_HOLD_S=60 -- A goes moving at ~70, no emplacing,
 # emplaced at ~180 (stationary 60s, raised).
 # ---------------------------------------------------------------------------
 
