@@ -30,6 +30,7 @@ from openddil.telemetry.v1 import telemetry_pb2 as pb
 from openddil.logistics.v1 import windowed_telemetry_pb2 as winpb
 from detection.algorithms import REGISTERED, EventView, AssetState, Anomaly
 from detection.units import from_proto
+from element_rollup import rollup_from_envelope
 from detection.windows import (
     Sample,
     build_window_spec,
@@ -124,6 +125,10 @@ app = faust.App(
     FAUST_APP_ID,
     broker=f"kafka://{KAFKA_BROKERS}",
     value_serializer="raw",
+    # Element snapshots run to several MB per record; the per-partition fetch
+    # default (1 MiB) is below that. Matches the element topic's
+    # max.message.bytes so a record the broker accepts is one we can fetch.
+    consumer_max_fetch_size=16 * 1024 * 1024,
 )
 
 raw_topic = app.topic("raw-sensor-stream", value_type=bytes)
@@ -132,6 +137,10 @@ events_topic = app.topic("tactical-events", value_type=bytes)
 # Phase 3.5: rolling-window aggregations consumed by the logistics fusion
 # service. Output records are openddil.telemetry.v1.WindowedTelemetry.
 windows_topic = app.topic("asset-telemetry-windows", value_type=bytes)
+# Element snapshots published on this edge's own broker, keyed by asset_id;
+# one JSON envelope per asset per ~30 s, up to a few MB each.
+ELEMENT_TOPIC = os.getenv("ELEMENT_TOPIC", "asset-element-telemetry")
+element_topic = app.topic(ELEMENT_TOPIC, value_type=bytes)
 
 # Window sizing — env-driven for ops tuning without code change.
 FLUID_WINDOW_NS = int(float(os.getenv("FLUID_WINDOW_MIN", "15")) * 60 * 1e9)
@@ -197,6 +206,11 @@ def _build_view(evt: pb.EntityTelemetryEvent) -> EventView:
 # ---------------------------------------------------------------------------
 window_buffers: dict[str, dict[str, deque]] = {}
 samples_since_last_emit: dict[str, int] = {}
+# Latest element rollup per asset. Both window producers (the raw path and the
+# element path) write the same key on the windows topic, so each attaches this
+# cache and neither clears what the other contributed.
+element_rollups: dict[str, winpb.ElementRollup] = {}
+_rollup_logged: set[str] = set()
 
 
 def _emit_window_for_asset(evt: pb.EntityTelemetryEvent,
@@ -204,13 +218,39 @@ def _emit_window_for_asset(evt: pb.EntityTelemetryEvent,
     """Build a WindowedTelemetry from the buffered samples for one asset.
     Returns None if there isn't enough data yet (no trend possible)."""
     aid = evt.asset.asset_id
-    buffers = window_buffers.get(aid, {})
-    if not buffers:
+    if not window_buffers.get(aid):
         return None
+    return _build_window(
+        aid,
+        evt.asset.platform_variant or "",
+        now_ns,
+        sample_time=evt.provenance.sample_time,
+        originator_nation=evt.provenance.originator_nation,
+        releasable_to=evt.provenance.releasable_to,
+        evt=evt,
+    )
+
+
+def _build_window(aid: str,
+                  platform_variant: str,
+                  now_ns: int,
+                  *,
+                  sample_time=None,
+                  originator_nation: str = "",
+                  releasable_to=(),
+                  evt: pb.EntityTelemetryEvent | None = None,
+                  window_range_ns: tuple[int, int] | None = None,
+                  ) -> winpb.WindowedTelemetry:
+    """Shared window construction for both producers: the raw path (which
+    passes the source event, for capacity and fault passthrough) and the
+    element path (which passes only the envelope's labels and a fixed range).
+    Carries whatever sustainment trends this asset's buffers already hold and
+    the cached element rollup, if any."""
+    buffers = window_buffers.get(aid, {})
 
     out = winpb.WindowedTelemetry()
     out.asset_id = aid
-    out.platform_variant = evt.asset.platform_variant or ""
+    out.platform_variant = platform_variant
     out.computed_at.FromNanoseconds(now_ns)
     # ADR-0023 Phase 6b §A.2: stamp origin-node provenance from this
     # faust-edge instance's env (faust-edge is already per-edge). The
@@ -218,8 +258,8 @@ def _emit_window_for_asset(evt: pb.EntityTelemetryEvent,
     # fallback; faust-regional's region-wear-trends aggregator (§B)
     # consumes it as an attributed input. Inherit producer_id/sample_time
     # from the source event when possible.
-    if evt.provenance.sample_time.seconds or evt.provenance.sample_time.nanos:
-        out.provenance.sample_time.CopyFrom(evt.provenance.sample_time)
+    if sample_time is not None and (sample_time.seconds or sample_time.nanos):
+        out.provenance.sample_time.CopyFrom(sample_time)
     out.provenance.producer_id = "faust-edge"
     out.provenance.edge_id = OPENDDIL_EDGE_ID
     out.provenance.region_id = OPENDDIL_REGION_ID
@@ -245,10 +285,10 @@ def _emit_window_for_asset(evt: pb.EntityTelemetryEvent,
     # No else-branch and no default. An unlabelled source event produces an
     # unlabelled window, which the gate then refuses; inventing a value here
     # would hide the thing the gate exists to surface.
-    if evt.provenance.originator_nation:
-        out.provenance.originator_nation = evt.provenance.originator_nation
-    if evt.provenance.releasable_to:
-        out.provenance.releasable_to.extend(evt.provenance.releasable_to)
+    if originator_nation:
+        out.provenance.originator_nation = originator_nation
+    if releasable_to:
+        out.provenance.releasable_to.extend(releasable_to)
 
     total_samples = 0
     window_min_start: int | None = None
@@ -278,7 +318,8 @@ def _emit_window_for_asset(evt: pb.EntityTelemetryEvent,
         ammo_slots[slot] = {"trend": trend}
     # Capacity passthrough from the latest event
     for slot, info in ammo_slots.items():
-        cs = evt.sustainment.consumables.items.get(slot)
+        cs = (evt.sustainment.consumables.items.get(slot)
+              if evt is not None else None)
         t = out.consumable_trends.add()
         t.slot_key = slot
         t.remaining.CopyFrom(trend_to_proto(info["trend"]))
@@ -310,18 +351,50 @@ def _emit_window_for_asset(evt: pb.EntityTelemetryEvent,
             t.remaining_useful_life.CopyFrom(trend_to_proto(r_trend))
 
     # Latest subsystem-fault tokens (passthrough — not aggregated)
-    if list(evt.sustainment.health.active_fault_codes):
+    if evt is not None and list(evt.sustainment.health.active_fault_codes):
         out.active_fault_codes_latest.extend(
             list(evt.sustainment.health.active_fault_codes),
         )
 
     # WindowSpec — use the widest range we covered.
+    if window_range_ns is not None:
+        start_ns, end_ns = window_range_ns
+    else:
+        start_ns, end_ns = window_min_start or now_ns, now_ns
     out.window.CopyFrom(build_window_spec(
-        window_start_ns=window_min_start or now_ns,
-        window_end_ns=now_ns,
+        window_start_ns=start_ns,
+        window_end_ns=end_ns,
         sample_count=total_samples,
     ))
+
+    rollup = element_rollups.get(aid)
+    if rollup is not None:
+        out.element_rollup.CopyFrom(rollup)
     return out
+
+
+def _window_from_envelope(env: dict,
+                          rollup: winpb.ElementRollup,
+                          now_ns: int) -> winpb.WindowedTelemetry:
+    """Window for the element path: the window spans the snapshot's own
+    observation instant, and labels come from the envelope (ADR-0029
+    PROPAGATE, no default -- see _build_window). The rollup is attached from
+    the cache, so the caller stores it there first."""
+    aid = env.get("asset_id") or ""
+    obs_ns = (rollup.observed_at.ToNanoseconds()
+              if rollup.HasField("observed_at") else now_ns)
+    releasable = env.get("releasable_to") or []
+    if not isinstance(releasable, list):
+        releasable = []
+    nation = env.get("originator_nation") or ""
+    return _build_window(
+        aid,
+        env.get("platform_variant") or "",
+        now_ns,
+        originator_nation=nation if isinstance(nation, str) else "",
+        releasable_to=[r for r in releasable if isinstance(r, str)],
+        window_range_ns=(obs_ns, obs_ns),
+    )
 
 
 def _buffer_event(evt: pb.EntityTelemetryEvent, now_ns: int) -> None:
@@ -355,6 +428,44 @@ def _buffer_event(evt: pb.EntityTelemetryEvent, now_ns: int) -> None:
     for comp, state in evt.sustainment.wear.components.items():
         _push(f"wear_hours:{comp}", state.hours_in_service)
         _push(f"wear_rul:{comp}",   state.remaining_useful_life)
+
+
+@app.agent(element_topic)
+async def process_elements(stream):
+    async for raw in stream:
+        try:
+            env = json.loads(raw)
+            if not isinstance(env, dict):
+                raise ValueError("envelope is not an object")
+        except Exception as e:
+            logging.error(f"Failed to parse element envelope: {e}")
+            continue
+
+        aid = env.get("asset_id")
+        if not aid or not isinstance(aid, str):
+            logger.debug("element envelope without asset_id; skipped")
+            continue
+        rollup = rollup_from_envelope(env)
+        if rollup is None:
+            continue
+        element_rollups[aid] = rollup
+
+        w = _window_from_envelope(env, rollup, int(time.time() * 1e9))
+        out_bytes = w.SerializeToString()
+        await windows_topic.send(key=aid.encode(), value=out_bytes)
+
+        if aid not in _rollup_logged:
+            _rollup_logged.add(aid)
+            log = logger.info
+        else:
+            log = logger.debug
+        log("element rollup emitted %s", {
+            "asset": aid,
+            "profile": rollup.profile_name,
+            "element_count": rollup.element_count,
+            "bytes_in": len(raw),
+            "bytes_out": len(out_bytes),
+        })
 
 
 @app.agent(raw_topic)
