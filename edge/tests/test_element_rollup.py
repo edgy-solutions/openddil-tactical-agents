@@ -150,3 +150,31 @@ def test_element_window_carries_existing_trends():
     w = _element_window(_envelope())
     assert "fuel_remaining" in w.fluid_trends
     assert w.element_rollup.element_count == 6
+
+
+COND = {
+    "level": "CONDITION_LEVEL_DEGRADED",
+    "moved_by": ["CONDITION_SOURCE_EMISSION"],
+    "claims": [
+        {"source": "CONDITION_SOURCE_APPEARANCE_DAMAGE", "level": "CONDITION_LEVEL_NOMINAL",
+         "detail": "damage NONE", "observed_at": "2026-10-08T12:00:00Z"},
+        {"source": "CONDITION_SOURCE_EMISSION", "level": "CONDITION_LEVEL_DEGRADED",
+         "detail": "2/4 beams", "observed_at": "2026-10-08T11:59:58Z"},
+    ],
+}
+
+
+def test_condition_is_carried_onto_the_rollup():
+    r = rollup_from_envelope(_envelope(operational={"condition": COND}))
+    assert r.HasField("condition")
+    assert r.condition.level == pb.CONDITION_LEVEL_DEGRADED
+    assert list(r.condition.moved_by) == [pb.CONDITION_SOURCE_EMISSION]
+    assert [c.detail for c in r.condition.claims] == ["damage NONE", "2/4 beams"]
+    assert r.condition.claims[1].observed_at.seconds > 0
+
+
+def test_absent_or_malformed_condition_leaves_it_unset():
+    assert not rollup_from_envelope(_envelope()).HasField("condition")
+    bad = rollup_from_envelope(_envelope(operational={"condition": {"level": "NOT_A_LEVEL"}}))
+    assert not bad.HasField("condition")
+    assert bad.element_count == len(HEALTH)

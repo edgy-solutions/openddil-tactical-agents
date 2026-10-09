@@ -9,6 +9,8 @@ No Faust, no Kafka, no I/O.
 """
 from __future__ import annotations
 
+from google.protobuf import json_format
+
 from openddil.logistics.v1 import windowed_telemetry_pb2 as winpb
 
 # These are the telemetry card's bands (openddil-demo frontend
@@ -68,4 +70,16 @@ def rollup_from_envelope(env: dict) -> "winpb.ElementRollup | None":
         out.core_temp_c = float(op["core_temp_c"])
     if _is_num(op.get("uptime_hours")):
         out.uptime_hours = float(op["uptime_hours"])
+
+    # The condition that moved the snapshot (level, the sources at it, every
+    # claim), copied as the producer wrote it so the uplink can say WHICH
+    # source moved the asset, not only that its counts changed. Absent stays
+    # absent; a malformed block is dropped rather than failing the rollup,
+    # since the counts above are still true without it.
+    cond = op.get("condition")
+    if isinstance(cond, dict):
+        try:
+            json_format.ParseDict(cond, out.condition, ignore_unknown_fields=True)
+        except json_format.ParseError:
+            out.ClearField("condition")
     return out
