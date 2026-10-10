@@ -242,3 +242,159 @@ def test_later_terminal_claim_overwrites_destroyed_to_removed():
     assert msg.destroyed == 0
     assert msg.removed == 1
     assert msg.asset_count == 1
+
+
+# ---------------------------------------------------------------------------
+# (e) `deactivated` is reversible: an appearance (a non-terminal record with
+#     the asset's own kinematics) is forwarded by the source and clears the
+#     aggregator's deactivated status. destroyed/removed are never cleared.
+# ---------------------------------------------------------------------------
+class _Clock:
+    def __init__(self):
+        self.t = 1000.0
+
+    def __call__(self):
+        return self.t
+
+
+class _CapturingProducer:
+    def __init__(self):
+        self.sent = []
+
+    async def send(self, topic, *, key, value):
+        self.sent.append((topic, key, value))
+
+
+def _raw(asset_id, status=tpb.OPERATIONAL_STATUS_UNSPECIFIED, *, kinematics=True):
+    ete = tpb.EntityTelemetryEvent()
+    ete.asset.asset_id = asset_id
+    ete.operational_state.operational_status = status
+    if kinematics:
+        ete.kinematics.SetInParent()
+    return ete.SerializeToString()
+
+
+def _forward(raw, producer, tracker):
+    _run(src._wrap_and_forward_operational_claim(
+        raw=raw, edge_id="edge-01", region_id="region-east",
+        fan_in_topic="region-east-fan-in", producer=producer,
+        appearances=tracker,
+    ))
+
+
+def test_source_forwards_appearance_after_deactivated_then_not_inside_interval():
+    clock = _Clock()
+    tracker = src._AppearanceTracker(60.0, clock=clock)
+    producer = _CapturingProducer()
+    # First sight of the asset: spend the interval-based forward on it so
+    # the assertions below are about the deactivated trigger alone.
+    _forward(_raw("asset-010"), producer, tracker)
+    assert len(producer.sent) == 1
+
+    _forward(_raw("asset-010", tpb.OPERATIONAL_STATUS_DEACTIVATED), producer, tracker)
+    assert len(producer.sent) == 2  # the terminal claim, exactly as before
+
+    clock.t += 1.0  # well inside the interval
+    _forward(_raw("asset-010"), producer, tracker)
+    assert len(producer.sent) == 3  # the appearance, forced by the claim
+    env = inp_pb.RegionalAggregatorInput()
+    env.ParseFromString(producer.sent[2][2])
+    assert env.WhichOneof("payload") == "operational_claim"
+    assert env.operational_claim.asset.asset_id == "asset-010"
+    assert env.operational_claim.operational_state.operational_status == \
+        tpb.OPERATIONAL_STATUS_UNSPECIFIED
+
+    clock.t += 1.0
+    _forward(_raw("asset-010"), producer, tracker)
+    assert len(producer.sent) == 3  # not again inside the interval
+
+
+def test_source_forwards_appearance_again_after_the_interval():
+    clock = _Clock()
+    tracker = src._AppearanceTracker(60.0, clock=clock)
+    producer = _CapturingProducer()
+    _forward(_raw("asset-011"), producer, tracker)
+    assert len(producer.sent) == 1  # no appearance yet for this asset
+
+    clock.t += 59.0
+    _forward(_raw("asset-011"), producer, tracker)
+    assert len(producer.sent) == 1
+
+    clock.t += 2.0
+    _forward(_raw("asset-011"), producer, tracker)
+    assert len(producer.sent) == 2
+
+
+def test_source_never_forwards_a_non_terminal_record_without_kinematics():
+    clock = _Clock()
+    tracker = src._AppearanceTracker(60.0, clock=clock)
+    producer = _CapturingProducer()
+    _forward(_raw("asset-012", tpb.OPERATIONAL_STATUS_DEACTIVATED), producer, tracker)
+    assert len(producer.sent) == 1
+    clock.t += 1000.0
+    _forward(_raw("asset-012", kinematics=False), producer, tracker)
+    _forward(_raw("asset-012", tpb.OPERATIONAL_STATUS_OPERATIONAL, kinematics=False),
+             producer, tracker)
+    assert len(producer.sent) == 1
+
+
+def _appearance_envelope(asset_id, *, kinematics=True):
+    ete = tpb.EntityTelemetryEvent()
+    ete.asset.asset_id = asset_id
+    if kinematics:
+        ete.kinematics.SetInParent()
+    env = inp_pb.RegionalAggregatorInput(
+        source_edge_id="edge-02", region_id="region-east", asset_id=asset_id,
+    )
+    env.operational_claim.CopyFrom(ete)
+    return env
+
+
+def test_aggregator_appearance_revives_deactivated():
+    table = _FakeTable()
+    _run(agg._apply_operational_claim(
+        _terminal_envelope("asset-020", tpb.OPERATIONAL_STATUS_DEACTIVATED), table))
+    assert table["asset-020"].operational_status == "deactivated"
+
+    _run(agg._apply_operational_claim(_appearance_envelope("asset-020"), table))
+    assert table["asset-020"].operational_status == ""
+    assert table["asset-020"].last_source_edge_id == "edge-02"
+
+    from google.protobuf.timestamp_pb2 import Timestamp
+    from openddil.regional.v1 import region_fleet_summary_pb2 as fs_pb
+    out_fs, out_tf, out_wt = _FakeOutTopic(), _FakeOutTopic(), _FakeOutTopic()
+    _run(agg._emit_class(
+        region_id="region-east", cls="", snapshot=list(table.items()),
+        now_ts=Timestamp(),
+        out_fleet_summary=out_fs, out_top_factors=out_tf, out_wear_trends=out_wt,
+    ))
+    msg = fs_pb.RegionFleetSummary()
+    msg.ParseFromString(out_fs.sent[0][1])
+    assert msg.deactivated == 0
+
+
+@pytest.mark.parametrize("status,name", [
+    (tpb.OPERATIONAL_STATUS_DESTROYED, "destroyed"),
+    (tpb.OPERATIONAL_STATUS_REMOVED, "removed"),
+])
+def test_aggregator_appearance_never_clears_destroyed_or_removed(status, name):
+    table = _FakeTable()
+    _run(agg._apply_operational_claim(_terminal_envelope("asset-021", status), table))
+    _run(agg._apply_operational_claim(_appearance_envelope("asset-021"), table))
+    assert table["asset-021"].operational_status == name
+
+
+def test_aggregator_appearance_does_not_create_an_entry_for_an_unknown_asset():
+    table = _FakeTable()
+    _run(agg._apply_operational_claim(_appearance_envelope("asset-022"), table))
+    assert "asset-022" not in table
+    assert len(table) == 0
+
+
+def test_aggregator_appearance_without_kinematics_does_not_revive():
+    table = _FakeTable()
+    _run(agg._apply_operational_claim(
+        _terminal_envelope("asset-023", tpb.OPERATIONAL_STATUS_DEACTIVATED), table))
+    _run(agg._apply_operational_claim(
+        _appearance_envelope("asset-023", kinematics=False), table))
+    assert table["asset-023"].operational_status == "deactivated"

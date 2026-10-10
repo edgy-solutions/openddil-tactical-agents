@@ -110,7 +110,10 @@ class AssetState(faust.Record, serializer="json"):
     # operational_claim (see _apply_operational_claim); no other handler in
     # this module may write it. Sticky: once set, never cleared by absence
     # or by any other input -- only a later terminal claim overwrites it
-    # (destroyed -> removed is legal).
+    # (destroyed -> removed is legal), plus one exception: "deactivated" is
+    # reversible, and returns to "" when the same asset's own kinematics
+    # reappear with no terminal claim (see _apply_operational_claim).
+    # "destroyed" and "removed" are never cleared.
     operational_status: str = ""
     # ADR-0029 releasability, carried per contributor so a rollup can be
     # composed from them. Defaults are the UNLABELLED state, and unlabelled
@@ -269,16 +272,21 @@ async def _apply_derived_sustainment(env, assets_latest) -> None:
 
 
 async def _apply_operational_claim(env, assets_latest) -> None:
-    """ADR-0044 §3. The source App has already filtered to a genuine
-    terminal claim before this envelope was ever produced -- the dict
-    lookup below is a defensive mirror of that filter, not the primary
-    one. `state.operational_status` is otherwise untouched by every other
-    _apply_* function in this module, which is what makes it sticky: an
-    asset's terminal status survives any number of later logistics/
+    """ADR-0044 §3. The source App forwards a genuine terminal claim, or
+    an "appearance" (a non-terminal record carrying the asset's own
+    kinematics). `state.operational_status` is otherwise untouched by every
+    other _apply_* function in this module, which is what makes it sticky:
+    an asset's terminal status survives any number of later logistics/
     cm-state/sustainment updates for the same asset_id, and moves only
     when another operational_claim arrives (destroyed -> removed is a
-    legal, ordinary overwrite -- there is no "undo" direction, a terminal
-    claim is never reversed back to "" by this function).
+    legal, ordinary overwrite).
+
+    The one undo: `deactivated` is reversible (ADR-0044), so an appearance
+    for an asset currently "deactivated" clears it back to "". An
+    appearance never creates an asset entry (entries feed the rollup
+    counts, and a record that is not a claim is no reason to count a new
+    asset), and never clears "destroyed" or "removed" -- a destroyed
+    entity keeps transmitting, and a Remove Entity has no undo on the wire.
     """
     ete = env.operational_claim
     asset_id = ete.asset.asset_id or env.asset_id or ""
@@ -286,6 +294,15 @@ async def _apply_operational_claim(env, assets_latest) -> None:
         return
     status = _OPERATIONAL_STATUS_COLUMN.get(ete.operational_state.operational_status)
     if status is None:
+        if not ete.HasField("kinematics") or asset_id not in assets_latest:
+            return
+        state = assets_latest[asset_id]
+        if state.operational_status != "deactivated":
+            return
+        state.operational_status = ""
+        state.last_updated_ns = int(time.time() * 1_000_000_000)
+        state.last_source_edge_id = env.source_edge_id or ""
+        assets_latest[asset_id] = state
         return
     state = assets_latest[asset_id]
     state.operational_status = status

@@ -19,13 +19,16 @@ Why a sidecar producer rather than pure Faust:
   rebalance/offset machinery on the harder side.
 
 Source Apps STAY STATELESS. No RocksDB Tables, no per-asset memory. Just
-wrap-and-forward. All state lives on the aggregator App.
+wrap-and-forward (the one in-memory exception is the appearance tracker for
+the operational_claim path, which is a rate limiter, never a source of
+truth). All state lives on the aggregator App.
 """
 from __future__ import annotations
 
 import asyncio
 import json
 import logging
+import os
 import time
 from typing import Optional
 
@@ -76,6 +79,59 @@ _TERMINAL_OPERATIONAL_STATUSES = frozenset({
 })
 
 
+class _AppearanceTracker:
+    """In-memory memory of which assets this source process has seen, so an
+    asset that comes back after being deactivated is forwarded as an
+    "appearance" and the aggregator can take it out of the deactivated count.
+
+    Deliberately not durable (the source App stays stateless in the sense
+    that matters: nothing here is a source of truth, and losing it only
+    costs one extra forwarded record). Two triggers, see `due`:
+
+      (a) this process forwarded a DEACTIVATED claim for the asset and has
+          not forwarded an appearance for it since;
+      (b) no appearance was forwarded for the asset in the last
+          `interval_s` seconds. This is what covers a source restart that
+          lost the set in (a): the first record seen for the asset after
+          the restart is forwarded, and so is one per interval after that.
+
+    `clock` is injectable so tests never sleep.
+    """
+
+    def __init__(self, interval_s: float, clock=time.monotonic) -> None:
+        self.interval_s = interval_s
+        self._clock = clock
+        self._deactivated: set[str] = set()
+        self._last_forwarded: dict[str, float] = {}
+
+    def note_deactivated(self, asset_id: str) -> None:
+        self._deactivated.add(asset_id)
+
+    def due(self, asset_id: str) -> bool:
+        if asset_id in self._deactivated:
+            return True
+        last = self._last_forwarded.get(asset_id)
+        return last is None or (self._clock() - last) >= self.interval_s
+
+    def forwarded(self, asset_id: str) -> None:
+        self._deactivated.discard(asset_id)
+        self._last_forwarded[asset_id] = self._clock()
+
+
+_APPEARANCE_INTERVAL_ENV = "REGIONAL_APPEARANCE_INTERVAL_S"
+_APPEARANCE_INTERVAL_DEFAULT_S = 60.0
+
+
+def _appearance_interval_s() -> float:
+    raw = os.environ.get(_APPEARANCE_INTERVAL_ENV, "")
+    try:
+        return float(raw) if raw else _APPEARANCE_INTERVAL_DEFAULT_S
+    except ValueError:
+        log.warning("%s=%r is not a number; using %ss", _APPEARANCE_INTERVAL_ENV,
+                    raw, _APPEARANCE_INTERVAL_DEFAULT_S)
+        return _APPEARANCE_INTERVAL_DEFAULT_S
+
+
 def make_source_app(
     *,
     region_id: str,
@@ -104,6 +160,9 @@ def make_source_app(
     # passed alongside the App into faust.Worker(...).
     hq_producer = _HqProducerService(hq_brokers=hq_brokers, label=app_id)
 
+    # Owned by this source app (one per edge), not a module global.
+    appearances = _AppearanceTracker(_appearance_interval_s())
+
     # One Faust agent per consumed edge topic; each agent unmarshals just
     # enough to extract asset_id (so the envelope can carry it for
     # partitioning), then wraps the raw bytes into the envelope's oneof
@@ -131,6 +190,7 @@ def make_source_app(
             await _wrap_and_forward_operational_claim(
                 raw=raw, edge_id=edge_id, region_id=region_id,
                 fan_in_topic=fan_in_topic, producer=hq_producer,
+                appearances=appearances,
             )
 
     return app, hq_producer
@@ -215,16 +275,25 @@ async def _wrap_and_forward_windowed_telemetry(
 async def _wrap_and_forward_operational_claim(
     *, raw: bytes, edge_id: str, region_id: str,
     fan_in_topic: str, producer: "_HqProducerService",
+    appearances: Optional[_AppearanceTracker] = None,
 ) -> None:
     """ADR-0044 §3. telemetry-latest-state carries EVERY asset update, not
     just terminal ones — unlike derived_sustainment/windowed_telemetry's
     topics, this one would flood the fan-in with a record for every
-    ordinary sample if forwarded unconditionally. Stateless filter-and-wrap:
-    only a genuine terminal operational_status claim (DESTROYED/DEACTIVATED/
-    REMOVED) is wrapped and forwarded; everything else — OPERATIONAL,
-    UNSPECIFIED, or the field absent entirely — is dropped right here, at
-    the source. Silence and OPERATIONAL are not signals for this column
-    (ADR-0044 §2), so they must never even reach the aggregator's Table.
+    ordinary sample if forwarded unconditionally. Filter-and-wrap: a
+    genuine terminal operational_status claim (DESTROYED/DEACTIVATED/
+    REMOVED) is always wrapped and forwarded. Silence and OPERATIONAL are
+    not signals for this column (ADR-0044 §2), so an ordinary record is
+    dropped right here, at the source, with ONE exception: `deactivated` is
+    reversible, and the aggregator's terminal status is sticky, so without
+    help its deactivated count could never come back down. So an unchanged
+    non-terminal record that carries the asset's own kinematics (an
+    "appearance") is also forwarded, sparingly, when `appearances` says it
+    is due: after this process forwarded a DEACTIVATED claim for the asset,
+    or when none has been forwarded for it within the appearance interval
+    (which also covers a source restart that lost the in-memory set).
+    The record is forwarded unmodified in the same operational_claim
+    envelope; with no `appearances` tracker, appearances are not forwarded.
     """
     if not raw:
         return
@@ -235,9 +304,16 @@ async def _wrap_and_forward_operational_claim(
         log.warning("%s: bad telemetry-latest-state EntityTelemetryEvent (len=%d): %s",
                     edge_id, len(raw), exc)
         return
-    if ete.operational_state.operational_status not in _TERMINAL_OPERATIONAL_STATUSES:
-        return
     asset_id = ete.asset.asset_id or ""
+    status = ete.operational_state.operational_status
+    if status not in _TERMINAL_OPERATIONAL_STATUSES:
+        if (appearances is None or not asset_id
+                or not ete.HasField("kinematics")
+                or not appearances.due(asset_id)):
+            return
+        appearances.forwarded(asset_id)
+    elif appearances is not None and status == tpb.OPERATIONAL_STATUS_DEACTIVATED:
+        appearances.note_deactivated(asset_id)
     env = inp_pb.RegionalAggregatorInput(
         source_edge_id=edge_id, region_id=region_id,
         wrapped_at=_now_timestamp(), asset_id=asset_id,
