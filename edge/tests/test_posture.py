@@ -27,14 +27,14 @@ DEFAULTS = Thresholds(move_speed_mps=1.0, move_hold_s=10.0, stop_hold_s=20.0)
 
 def test_cold_start_stationary_stowed_stays_unspecified():
     # "cold start (no prior state) | stationary, stowed | unspecified"
-    s = step(COLD_START, launcher_raised=False, speed=0.0, now=0.0, th=DEFAULTS)
+    s = step(COLD_START, deploy_signal=False, speed=0.0, now=0.0, th=DEFAULTS)
     assert s.posture == "unspecified"
     assert s.posture_since is None
 
 
 def test_cold_start_stationary_raised_goes_emplaced_immediately():
     # row 3 (unspecified is in the from-set), no hold required
-    s = step(COLD_START, launcher_raised=True, speed=0.0, now=5.0, th=DEFAULTS)
+    s = step(COLD_START, deploy_signal=True, speed=0.0, now=5.0, th=DEFAULTS)
     assert s.posture == "emplaced"
     assert s.posture_since == 5.0
 
@@ -42,7 +42,7 @@ def test_cold_start_stationary_raised_goes_emplaced_immediately():
 def test_any_but_moving_moving_held_enough_goes_moving():
     prev = PostureState("emplaced", 0.0, "moving", 50.0)
     # held = 60 - 50 = 10 >= move_hold_s(10)
-    s = step(prev, launcher_raised=True, speed=5.0, now=60.0, th=DEFAULTS)
+    s = step(prev, deploy_signal=True, speed=5.0, now=60.0, th=DEFAULTS)
     assert s.posture == "moving"
     assert s.posture_since == 60.0
 
@@ -50,63 +50,63 @@ def test_any_but_moving_moving_held_enough_goes_moving():
 def test_any_but_moving_moving_held_not_enough_stays_put():
     prev = PostureState("emplaced", 0.0, "moving", 55.0)
     # held = 60 - 55 = 5 < 10
-    s = step(prev, launcher_raised=True, speed=5.0, now=60.0, th=DEFAULTS)
+    s = step(prev, deploy_signal=True, speed=5.0, now=60.0, th=DEFAULTS)
     assert s.posture == "emplaced"
     assert s.posture_since == 0.0
 
 
-def test_moving_stationary_held_enough_launcher_false_goes_emplacing():
+def test_moving_stationary_held_enough_signal_false_goes_emplacing():
     prev = PostureState("moving", 70.0, "stationary", 120.0)
-    s = step(prev, launcher_raised=False, speed=0.0, now=140.0, th=DEFAULTS)
+    s = step(prev, deploy_signal=False, speed=0.0, now=140.0, th=DEFAULTS)
     assert s.posture == "emplacing"
     assert s.posture_since == 140.0
 
 
-def test_moving_stationary_held_enough_launcher_true_goes_emplaced():
+def test_moving_stationary_held_enough_signal_true_goes_emplaced():
     prev = PostureState("moving", 70.0, "stationary", 120.0)
-    s = step(prev, launcher_raised=True, speed=0.0, now=140.0, th=DEFAULTS)
+    s = step(prev, deploy_signal=True, speed=0.0, now=140.0, th=DEFAULTS)
     assert s.posture == "emplaced"
     assert s.posture_since == 140.0
 
 
 def test_emplacing_stationary_raised_goes_emplaced_no_hold():
     prev = PostureState("emplacing", 140.0, "stationary", 120.0)
-    s = step(prev, launcher_raised=True, speed=0.0, now=141.0, th=DEFAULTS)
+    s = step(prev, deploy_signal=True, speed=0.0, now=141.0, th=DEFAULTS)
     assert s.posture == "emplaced"
     assert s.posture_since == 141.0
 
 
 def test_march_ordered_stationary_raised_goes_emplaced():
     prev = PostureState("march_ordered", 30.0, "stationary", 0.0)
-    s = step(prev, launcher_raised=True, speed=0.0, now=40.0, th=DEFAULTS)
+    s = step(prev, deploy_signal=True, speed=0.0, now=40.0, th=DEFAULTS)
     assert s.posture == "emplaced"
 
 
-def test_emplaced_launcher_false_goes_march_ordered_no_hold():
+def test_emplaced_signal_false_goes_march_ordered_no_hold():
     prev = PostureState("emplaced", 0.0, "stationary", 0.0)
-    s = step(prev, launcher_raised=False, speed=0.0, now=30.0, th=DEFAULTS)
+    s = step(prev, deploy_signal=False, speed=0.0, now=30.0, th=DEFAULTS)
     assert s.posture == "march_ordered"
     assert s.posture_since == 30.0
 
 
-def test_no_launcher_bit_moves_to_moving_by_speed_rule_only():
-    # "any | launcher_raised None | only moving or unspecified: moving by
+def test_no_deploy_signal_moves_to_moving_by_speed_rule_only():
+    # "any | deploy_signal None | only moving or unspecified: moving by
     # the speed rule"
     prev = PostureState("unspecified", None, "moving", 0.0)
-    s = step(prev, launcher_raised=None, speed=5.0, now=10.0, th=DEFAULTS)
+    s = step(prev, deploy_signal=None, speed=5.0, now=10.0, th=DEFAULTS)
     assert s.posture == "moving"
 
 
-def test_no_launcher_bit_after_stophold_goes_unspecified_not_emplacing():
+def test_no_deploy_signal_after_stophold_goes_unspecified_not_emplacing():
     prev = PostureState("moving", 10.0, "stationary", 20.0)
-    s = step(prev, launcher_raised=None, speed=0.0, now=40.0, th=DEFAULTS)
+    s = step(prev, deploy_signal=None, speed=0.0, now=40.0, th=DEFAULTS)
     assert s.posture == "unspecified"
     assert s.posture_since == 40.0
 
 
 def test_speed_none_holds_previous_motion_no_update():
     prev = PostureState("moving", 10.0, "moving", 10.0)
-    s = step(prev, launcher_raised=True, speed=None, now=100.0, th=DEFAULTS)
+    s = step(prev, deploy_signal=True, speed=None, now=100.0, th=DEFAULTS)
     # motion/motion_since untouched; held grows, but since motion/_since are
     # literally carried over (not recomputed from a fresh observation), the
     # held-time check in row 2 still uses the untouched motion_since.
@@ -133,7 +133,7 @@ def test_power_plant_is_not_a_gate():
 def test_only_stow_stays_unspecified_whole_run():
     state = COLD_START
     for t in range(0, 201):
-        state = step(state, launcher_raised=False, speed=0.0, now=float(t), th=DEFAULTS)
+        state = step(state, deploy_signal=False, speed=0.0, now=float(t), th=DEFAULTS)
     assert state.posture == "unspecified"
     assert state.posture_since is None
 
@@ -148,28 +148,28 @@ _SCHEDULE = [(0, "raise"), (30, "stow"), (60, "move"), (120, "stop"), (150, "rai
 
 
 def _schedule_state(schedule, t):
-    launcher_raised = None
+    deploy_signal = None
     moving = False
     for at, action in schedule:
         if at > t:
             break
         if action == "raise":
-            launcher_raised = True
+            deploy_signal = True
         elif action == "stow":
-            launcher_raised = False
+            deploy_signal = False
         elif action == "move":
             moving = True
         elif action == "stop":
             moving = False
-    return launcher_raised, (5.0 if moving else 0.0)
+    return deploy_signal, (5.0 if moving else 0.0)
 
 
 def _replay(schedule, th, t_end=200):
     state = COLD_START
     transitions = []
     for t in range(0, t_end + 1):
-        launcher_raised, speed = _schedule_state(schedule, t)
-        new_state = step(state, launcher_raised, speed, float(t), th)
+        deploy_signal, speed = _schedule_state(schedule, t)
+        new_state = step(state, deploy_signal, speed, float(t), th)
         if new_state.posture != state.posture:
             transitions.append((t, state.posture, new_state.posture))
         state = new_state
@@ -215,5 +215,5 @@ def test_stop_hold_60_skips_emplacing_goes_straight_to_emplaced():
 
 def test_move_hold_boundary_is_inclusive():
     prev = PostureState("emplaced", 0.0, "moving", 0.0)
-    s = step(prev, launcher_raised=True, speed=5.0, now=DEFAULTS.move_hold_s, th=DEFAULTS)
+    s = step(prev, deploy_signal=True, speed=5.0, now=DEFAULTS.move_hold_s, th=DEFAULTS)
     assert s.posture == "moving"

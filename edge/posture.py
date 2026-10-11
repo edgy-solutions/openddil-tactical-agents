@@ -2,9 +2,9 @@
 Posture state machine (ADR-0044 amendment, "posture, a third column").
 
 Rules, mirroring detection/algorithms.py's framework-agnostic contract:
-1. Pure function: (prev_state, launcher_raised, speed, now, thresholds) ->
+1. Pure function: (prev_state, deploy_signal, speed, now, thresholds) ->
    new_state. No I/O, no Faust types, no proto types, no logging.
-2. The caller (edge/faust_edge.py) is responsible for pulling launcher_raised,
+2. The caller (edge/faust_edge.py) is responsible for pulling deploy_signal,
    speed and now out of the proto event and for converting the string state
    names here into whatever wire representation (proto enum, DB text) it
    needs. This module never imports openddil.telemetry.
@@ -13,8 +13,13 @@ WHAT THIS DECIDES, AND WHAT IT DOES NOT:
   posture is a DECIDED value (emplaced / march_ordered / moving / emplacing /
   unspecified), computed from two independent inputs that may each be absent
   on any given record:
-    - launcher_raised: True / False / None. None means "this platform's
-      domain has no launcher bit at all" (e.g. air), not "unknown this tick".
+    - deploy_signal: True / False / None. The deployment signal is the
+      variant's own declared signal: the launcher bit (raised / stowed) for
+      launcher variants, or the emitter state (emitting / not emitting) for
+      sensor variants. None means the variant declares no signal, or made no
+      claim this tick -- never a guessed value. A stopped asset with None
+      reads unspecified, never a guessed emplaced; an emplaced asset with
+      None stays emplaced (only an explicit False march-orders it).
     - speed: a float m/s, or None meaning "no velocity reading this tick"
       (hold whatever motion state we already had; never guess a value).
   motion (moving / stationary / "") is an internal input to posture, not
@@ -28,20 +33,20 @@ WHAT THIS DECIDES, AND WHAT IT DOES NOT:
 
 TRANSITION TABLE (first matching row wins; evaluated in this order):
   1. posture != "moving" AND motion == "moving" held >= move_hold_s
-       -> moving                                   (launcher_raised ignored)
+       -> moving                                   (deploy_signal ignored)
   2. posture == "moving" AND motion == "stationary" held >= stop_hold_s
-       -> launcher_raised is None:  unspecified     (no launcher signal to
+       -> deploy_signal is None:  unspecified       (no deployment signal to
                                                       disambiguate — never
                                                       guess emplaced/emplacing)
-       -> launcher_raised is True:  emplaced
-       -> launcher_raised is False: emplacing
+       -> deploy_signal is True:  emplaced
+       -> deploy_signal is False: emplacing
   3. posture in {emplacing, unspecified, march_ordered} AND motion ==
-     "stationary" AND launcher_raised is True
+     "stationary" AND deploy_signal is True
        -> emplaced                                 (immediate, no hold)
-  4. posture == "emplaced" AND launcher_raised is False
+  4. posture == "emplaced" AND deploy_signal is False
        -> march_ordered                             (immediate, no hold)
   (cold start, posture defaults to "unspecified"; a first reading of
-  stationary + stowed matches none of the above and correctly stays
+  stationary + signal-off matches none of the above and correctly stays
   unspecified rather than guessing — this is COLD_START's own result, not a
   separate row.)
 """
@@ -78,7 +83,7 @@ COLD_START = PostureState(posture=UNSPECIFIED, posture_since=None, motion="", mo
 
 def step(
     prev: PostureState,
-    launcher_raised: Optional[bool],
+    deploy_signal: Optional[bool],
     speed: Optional[float],
     now: float,
     th: Thresholds,
@@ -115,19 +120,19 @@ def step(
     if posture != MOVING and motion == MOVING and held >= th.move_hold_s:
         _to(MOVING)
     elif posture == MOVING and motion == "stationary" and held >= th.stop_hold_s:
-        if launcher_raised is None:
+        if deploy_signal is None:
             _to(UNSPECIFIED)
-        elif launcher_raised:
+        elif deploy_signal:
             _to(EMPLACED)
         else:
             _to(EMPLACING)
     elif (
         posture in (EMPLACING, UNSPECIFIED, MARCH_ORDERED)
         and motion == "stationary"
-        and launcher_raised is True
+        and deploy_signal is True
     ):
         _to(EMPLACED)
-    elif posture == EMPLACED and launcher_raised is False:
+    elif posture == EMPLACED and deploy_signal is False:
         _to(MARCH_ORDERED)
 
     return PostureState(posture=posture, posture_since=posture_since, motion=motion, motion_since=motion_since)

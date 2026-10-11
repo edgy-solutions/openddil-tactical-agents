@@ -90,27 +90,33 @@ _POSTURE_TO_PROTO = {
 # In-memory only -- a restart or reset losing this is harmless: it only
 # widens which records get the byte-identical fast path for a short while,
 # never a correctness issue (see the emission comment in process() below).
-_launcher_ever_seen: dict[str, bool] = {}
+_signal_ever_seen: dict[str, bool] = {}
 
 
 def _posture_inputs(evt: "pb.EntityTelemetryEvent"):
     """Pull the state machine's three inputs out of the parsed event.
 
-    Returns (launcher_raised, speed, now):
-      - launcher_raised: True/False if the field was set, else None (this
-        platform's domain has no launcher bit at all -- HasField, not a
-        truthiness check, so an explicit False is never confused with unset).
+    Returns (deploy_signal, speed, now):
+      - deploy_signal: the variant's deployment signal. The mapper passes at
+        most ONE per variant: launcher_raised (launcher variants) or emitting
+        (sensor variants). launcher_raised is checked first only as a
+        tie-break that should never occur. True/False if the field was set,
+        else None (the variant declares no signal, or no claim this tick) --
+        HasField, not a truthiness check, so an explicit False is never
+        confused with unset.
       - speed: |velocity| in m/s, computed from kinematics.velocity.ecef
         only (ground_speed is a separate, never-populated-for-DIS field --
         see the ADR-0044 amendment). None if no ecef velocity was sent.
       - now: provenance.sample_time as epoch seconds (the record's OWN event
         time, not wall clock, so replay stays deterministic).
     """
-    launcher_raised = (
-        evt.operational_state.launcher_raised
-        if evt.operational_state.HasField("launcher_raised")
-        else None
-    )
+    op = evt.operational_state
+    if op.HasField("launcher_raised"):
+        deploy_signal = op.launcher_raised
+    elif op.HasField("emitting"):
+        deploy_signal = op.emitting
+    else:
+        deploy_signal = None
     vel = evt.kinematics.velocity
     if vel.WhichOneof("frame") == "ecef":
         v = vel.ecef
@@ -119,7 +125,7 @@ def _posture_inputs(evt: "pb.EntityTelemetryEvent"):
         speed = None
     ts = evt.provenance.sample_time
     now = ts.seconds + ts.nanos / 1e9
-    return launcher_raised, speed, now
+    return deploy_signal, speed, now
 
 app = faust.App(
     FAUST_APP_ID,
@@ -489,9 +495,9 @@ async def process(stream):
         # column"). Decided ONCE, here, at the owning (edge) tier; every
         # other tier (projector, store) only carries what we decide here,
         # never re-derives it.
-        launcher_raised, speed, posture_now = _posture_inputs(evt)
-        if launcher_raised is not None:
-            _launcher_ever_seen[aid] = True
+        deploy_signal, speed, posture_now = _posture_inputs(evt)
+        if deploy_signal is not None:
+            _signal_ever_seen[aid] = True
         prev_posture_state = posture_mod.PostureState(
             posture=rec.posture,
             posture_since=rec.posture_since,
@@ -499,7 +505,7 @@ async def process(stream):
             motion_since=rec.motion_since,
         )
         new_posture_state = posture_mod.step(
-            prev_posture_state, launcher_raised, speed, posture_now, POSTURE_THRESHOLDS
+            prev_posture_state, deploy_signal, speed, posture_now, POSTURE_THRESHOLDS
         )
         if new_posture_state.posture != prev_posture_state.posture:
             logger.info("posture transition %s", {
@@ -515,13 +521,13 @@ async def process(stream):
 
         # 1. Forward to latest-state. Byte-identical to today UNLESS this
         # asset's posture is anything but unspecified, OR it has ever
-        # carried a launcher_raised signal at all (even a steady False) --
+        # carried a deployment signal at all (even a steady False) --
         # so traffic that never touches posture (no DIS appearance, or a
-        # domain with no launcher bit at all) stays byte-identical on the
+        # variant with no deployment signal) stays byte-identical on the
         # wire, exactly as it was before this feature existed.
         posture_untouched = (
             new_posture_state.posture == posture_mod.UNSPECIFIED
-            and not _launcher_ever_seen.get(aid, False)
+            and not _signal_ever_seen.get(aid, False)
         )
         if posture_untouched:
             await state_topic.send(key=aid, value=raw)
