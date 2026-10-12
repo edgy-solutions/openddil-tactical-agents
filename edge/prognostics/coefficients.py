@@ -2,7 +2,7 @@
 
 THESE ARE NOT CALIBRATED — they are authored placeholders. Per ADR-0020,
 Phase 5 demonstrates the *mechanism*; the *coefficients* are validated
-against measured ground truth in the deferred AFSIM / VR-Forces phase.
+against measured ground truth in the deferred AFSIM or co-located-simulator phase.
 Env-overridable so a future calibration run can swap values without a
 code change. Order-of-magnitude reasonable for heavy ground platforms;
 that is the most that should be claimed for any of these numbers.
@@ -24,7 +24,7 @@ class WearCoefficients:
 
     # Distance-driven track wear: total track life in km. After
     # `track_life_total_km` of cumulative distance the track is "spent."
-    # Placeholder; real calibration is the AFSIM/VR-Forces phase.
+    # Placeholder; real calibration is the AFSIM or co-located-simulator phase.
     track_life_total_km: float = 5000.0
 
     # Operating-hours engine wear: total engine life in operating hours.

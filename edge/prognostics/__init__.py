@@ -10,7 +10,7 @@ it once at app load. Everything else is purposely contained:
 Phase 5 demonstrates the *mechanism* on synthetic data — see ADR-0020 for
 what this engine claims (pipeline works end-to-end) and what it does not
 (numbers are accurate). Validation against measured ground truth is the
-deferred AFSIM / VR-Forces phase.
+deferred AFSIM or co-located-simulator phase.
 """
 from prognostics.agent import register  # noqa: F401
 
