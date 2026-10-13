@@ -42,6 +42,7 @@ from detection.windows import (
 # no Faust/proto types (same boundary discipline as detection/algorithms.py).
 # Aliased so the StateRecord field named `posture` below never shadows it.
 import posture as posture_mod
+from posture_event import build_transition_event
 
 logger = logging.getLogger(__name__)
 # Phase 5 prognostics derivation engine — the one-line seam (ADR-0020).
@@ -540,6 +541,24 @@ async def process(stream):
                 )
             evt.operational_state.posture_status = _POSTURE_TO_PROTO[new_posture_state.posture]
             await state_topic.send(key=aid, value=evt.SerializeToString())
+
+        # 1.0 Append the transition as its own record on tactical-events,
+        # after the latest-state send (compaction would otherwise lose it).
+        if new_posture_state.posture != prev_posture_state.posture:
+            await events_topic.send(
+                key=aid,
+                value=json.dumps(build_transition_event(
+                    aid,
+                    prev_posture_state,
+                    new_posture_state,
+                    deploy_signal,
+                    speed,
+                    evt.provenance.originator_nation,
+                    list(evt.provenance.releasable_to),
+                    OPENDDIL_EDGE_ID,
+                    OPENDDIL_REGION_ID,
+                )).encode("utf-8"),
+            )
 
         # 1a. Windowing — buffer this sample and (every N samples) emit a
         # WindowedTelemetry for the logistics fusion service.
