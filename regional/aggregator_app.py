@@ -147,6 +147,15 @@ def make_aggregator_app(
         partitions=1,
     )
 
+    # Which (stream, class) partials this aggregator has emitted and not yet
+    # retired. Changelog-backed like assets_latest, so a restart remembers
+    # what the compacted topics still hold. See _retire_vanished.
+    emitted = app.Table(
+        f"region_{region_id.replace('-', '_')}_emitted_partials",
+        default=bool,
+        partitions=1,
+    )
+
     fan_in = app.topic(fan_in_topic, value_type=bytes)
 
     out_fleet_summary = app.topic(_TOPIC_FLEET_SUMMARY, value_type=bytes)
@@ -185,6 +194,7 @@ def make_aggregator_app(
         await _emit_rollups(
             region_id=region_id,
             assets_latest=assets_latest,
+            emitted=emitted,
             out_fleet_summary=out_fleet_summary,
             out_top_factors=out_top_factors,
             out_wear_trends=out_wear_trends,
@@ -337,15 +347,17 @@ async def _emit_rollups(
     *,
     region_id: str,
     assets_latest,
+    emitted,
     out_fleet_summary,
     out_top_factors,
     out_wear_trends,
 ) -> None:
     snapshot = list(assets_latest.items())
-    if not snapshot:
+    if not snapshot and not emitted:
         # Cold start — projector cold-state surfaces "Awaiting first
         # emission..." in the UI. Skip emit until at least one asset has
-        # been observed.
+        # been observed. (An empty snapshot WITH emitted partials is not
+        # cold start: every class we emitted has vanished and must retire.)
         return
 
     now_ns = int(time.time() * 1_000_000_000)
@@ -355,8 +367,9 @@ async def _emit_rollups(
     # ONE PARTIAL PER RELEASABILITY CLASS. Every emission below is computed
     # over ONE class's contributors only, so no number ever contains data its
     # audience cannot see, and each partial is an ordinary labelled row.
+    sent: set = set()
     for cls, members in sorted(_partition_by_audience(snapshot).items()):
-        await _emit_class(
+        streams = await _emit_class(
             region_id=region_id,
             cls=cls,
             snapshot=members,
@@ -365,6 +378,78 @@ async def _emit_rollups(
             out_top_factors=out_top_factors,
             out_wear_trends=out_wear_trends,
         )
+        sent.update(f"{stream}|{cls}" for stream in streams)
+
+    # RETIRE WHAT VANISHED. The output topics are compacted and the projector
+    # upserts on (region_id, releasability_class), so a partial that is simply
+    # never sent again is never removed: its last row stays, with its old
+    # counts. When an asset is relabelled (unlabelled -> ATL, say) the class
+    # it left can disappear from the partition, and that stale row would
+    # count the asset a second time next to the class it moved to. The same
+    # holds for a class whose top factors or wear trends have gone empty.
+    # So a (stream, class) emitted before and absent now is overwritten with
+    # an all-zero / empty row under the same key. The retirement row is an
+    # ordinary labelled row carrying the class it retires (see
+    # _send_retirement), so it reveals nothing beyond what that class
+    # already showed.
+    for key in list(emitted.keys()):
+        if key in sent:
+            continue
+        stream, _, cls = key.partition("|")
+        await _send_retirement(
+            region_id=region_id,
+            stream=stream,
+            cls=cls,
+            now_ts=now_ts,
+            out_fleet_summary=out_fleet_summary,
+            out_top_factors=out_top_factors,
+            out_wear_trends=out_wear_trends,
+        )
+        del emitted[key]
+        log.info("aggregator(%s): retired %s partial for class %s",
+                 region_id, stream, cls or "<none>")
+    for key in sent:
+        emitted[key] = True
+
+
+async def _send_retirement(
+    *,
+    region_id: str,
+    stream: str,
+    cls: str,
+    now_ts,
+    out_fleet_summary,
+    out_top_factors,
+    out_wear_trends,
+) -> None:
+    """Overwrite one vanished (stream, class) partial with an empty row."""
+    key = _partial_key(region_id, cls)
+    if stream == "fleet":
+        msg = fs_pb.RegionFleetSummary(
+            region_id=region_id, nominal=0, degraded=0, critical=0,
+            non_operational=0, destroyed=0, deactivated=0, removed=0,
+            asset_count=0,
+        )
+        out = out_fleet_summary
+    elif stream == "factors":
+        msg = tf_pb.RegionTopFactors(region_id=region_id)
+        out = out_top_factors
+    elif stream == "wear":
+        msg = wt_pb.RegionWearTrends(region_id=region_id)
+        out = out_wear_trends
+    else:
+        log.warning("aggregator(%s): unknown emitted stream %r; dropping",
+                    region_id, stream)
+        return
+    msg.observed_at.CopyFrom(now_ts)
+    _stamp_provenance(msg.provenance, region_id, now_ts, _class_releasable(cls))
+    await out.send(key=key, value=msg.SerializeToString())
+
+
+def _class_releasable(cls: str) -> list:
+    """releasable_to for a class: its members, sorted. The one derivation
+    shared by live partials and their retirements."""
+    return sorted(x for x in cls.split(",") if x)
 
 
 async def _emit_class(
@@ -376,11 +461,14 @@ async def _emit_class(
     out_fleet_summary,
     out_top_factors,
     out_wear_trends,
-) -> None:
+) -> set:
+    """Emit one class's partials; return the stream names actually sent
+    (a subset of {"fleet", "factors", "wear"}; fleet is always present)."""
+    sent = {"fleet"}
     # The class IS the audience. A partial claims no originator -- its class
     # is who may see it, not who wrote it -- so the §4 disjunction's first
     # branch stays closed and access is decided by the class alone.
-    releasable = sorted(x for x in cls.split(",") if x)
+    releasable = _class_releasable(cls)
 
     # ---- fleet summary -----------------------------------------------------
     # ADR-0044 §3: an asset with a terminal operational_status is counted in
@@ -443,6 +531,7 @@ async def _emit_class(
         tf_msg.observed_at.CopyFrom(now_ts)
         _stamp_provenance(tf_msg.provenance, region_id, now_ts, releasable)
         await out_top_factors.send(key=_partial_key(region_id, cls), value=tf_msg.SerializeToString())
+        sent.add("factors")
 
     # ---- wear trends -------------------------------------------------------
     # Per the mixed-unit handling rule: group by (component_id, unit).
@@ -466,6 +555,8 @@ async def _emit_class(
         wt_msg.observed_at.CopyFrom(now_ts)
         _stamp_provenance(wt_msg.provenance, region_id, now_ts, releasable)
         await out_wear_trends.send(key=_partial_key(region_id, cls), value=wt_msg.SerializeToString())
+        sent.add("wear")
+    return sent
 
 
 def _carry_labels(state, provenance) -> None:
