@@ -427,7 +427,10 @@ async def _emit_rollups(
         log.info("aggregator(%s): retired %s partial for class %s",
                  region_id, stream, cls or "<none>")
     for key in sent:
-        emitted[key] = True
+        # A key already present is not rewritten, so the changelog only takes a
+        # record when a class first appears.
+        if key not in emitted:
+            emitted[key] = True
 
 
 async def _send_retirement(

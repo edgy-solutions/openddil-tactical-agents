@@ -146,3 +146,31 @@ def test_emit_rollups_outside_stream_is_refused_by_faust(rig):
             out_fleet_summary=topics["out_fleet_summary"],
             out_top_factors=topics["out_top_factors"],
             out_wear_trends=topics["out_wear_trends"]))
+
+
+def test_unchanged_classes_are_not_rewritten_to_the_changelog(rig):
+    # A key already in the emitted Table must not be written again: the
+    # changelog takes a record only when a class first appears (or retires).
+    async def scenario():
+        _yield_per_tick(rig.agent)
+        async with rig.agent.test_context() as agent:
+            rig.set_assets({"a1": [], "a2": ["ATL"], "a3": ["BRV"]})
+            await agent.put(b"\x01")
+            after_first = (list(rig.changelog), set(rig.emitted.data.keys()))
+            await agent.put(b"\x01")
+            after_second = (list(rig.changelog), set(rig.emitted.data.keys()))
+            rig.set_assets({"a1": [], "a2": ["ATL"]})
+            await agent.put(b"\x01")
+            after_third = (list(rig.changelog), set(rig.emitted.data.keys()))
+            return after_first, after_second, after_third
+
+    first, second, third = rig.run(scenario())
+    keys = {"fleet|", "fleet|ATL", "fleet|BRV"}
+    assert first[1] == keys
+    assert len(first[0]) == len(keys)
+    assert second[1] == keys
+    assert len(second[0]) == len(keys)  # no rewrite on an unchanged tick
+    # The vanished class is deleted: one tombstone through send_changelog.
+    assert third[1] == keys - {"fleet|BRV"}
+    assert len(third[0]) == len(keys) + 1
+    assert third[0][-1] == ("fleet|BRV", None)
