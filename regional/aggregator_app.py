@@ -216,7 +216,7 @@ def make_aggregator_app(
 
     @app.timer(interval=timedelta(seconds=_HEARTBEAT_S))
     async def heartbeat():
-        await sweep_tick.send(value=b"")
+        await sweep_tick.send(value=b"\x01")
 
     return app
 
