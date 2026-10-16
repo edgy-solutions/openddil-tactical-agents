@@ -26,6 +26,19 @@ jobs:
           sudo apt-get update && sudo apt-get install -y libsnappy-dev
           pip install "faust-streaming>=0.10.0" "aiokafka<0.12.0" python-snappy pyyaml watchdog pint==0.24.4 \
             "protobuf>=6.30.0,<7.0.0" pytest
+      # gen/ is gitignored in openddil-contracts, so the checkout supplies only
+      # proto/. Generate after the install, pinned to the installed protobuf
+      # runtime (the order openddil-cm-service's python-checks.yml explains),
+      # and prove one module imports before any test runs.
+      - name: Generate protobuf bindings
+        run: |
+          PB=$(python -c "import google.protobuf as p; print(p.__version__)")
+          pip install "grpcio-tools" "protobuf==$PB"
+          cd openddil-contracts
+          mkdir -p gen/python
+          python -m grpc_tools.protoc --proto_path=proto --python_out=gen/python $(find proto -name '*.proto')
+          echo "generated $(find gen/python -name '*_pb2.py' | wc -l) protobuf modules"
+          PYTHONPATH=gen/python python -c "from openddil.telemetry.v1 import telemetry_pb2"
       - name: produces manifest equals the code
         env:
           PYTHONPATH: ${{ github.workspace }}/openddil-contracts/gen/python
