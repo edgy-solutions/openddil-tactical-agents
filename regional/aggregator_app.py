@@ -26,8 +26,9 @@ asset's latest contributions to all three rollups:
   - sustainment_wear    (dict of {component_id: {unit, rul_remaining}})
   - last_updated_ns
 
-Three aggregator agents emit rolled-up topics on heartbeat AND on
-state-change.
+Three aggregator agents emit rolled-up topics on a heartbeat tick AND on
+state-change. The heartbeat timer only sends a tick; the tick agent does
+the emit, inside stream iteration (Faust Table writes require it).
 
 ASYMMETRIC COVERAGE per §B greenlight: asset_telemetry_windows envelopes
 ARE consumed (the source Apps wrap them, the fan-in agent dispatches by
@@ -139,7 +140,7 @@ def make_aggregator_app(
     )
 
     # State table — keyed by asset_id, holds the latest contribution from
-    # each input stream so the heartbeat emit can recompute the rollups
+    # each input stream so the tick-driven sweep can recompute the rollups
     # from a single in-process snapshot.
     assets_latest = app.Table(
         f"region_{region_id.replace('-', '_')}_assets_latest",
@@ -189,16 +190,33 @@ def make_aggregator_app(
                 continue
             await _dispatch_envelope(env, assets_latest)
 
+    # Faust refuses Table writes outside stream iteration, and a timer body
+    # runs outside any stream. The timer therefore only sends a tick; the
+    # sweep itself runs in the agent below, where `emitted` may be written.
+    sweep_tick = app.topic(
+        f"{app.conf.id}-sweep-tick",
+        value_type=bytes,
+        partitions=1,
+        internal=True,
+        retention=timedelta(hours=1),
+    )
+
+    @app.agent(sweep_tick)
+    async def on_sweep_tick(stream):
+        """Recompute and emit the rollups once per tick."""
+        async for _ in stream:
+            await _emit_rollups(
+                region_id=region_id,
+                assets_latest=assets_latest,
+                emitted=emitted,
+                out_fleet_summary=out_fleet_summary,
+                out_top_factors=out_top_factors,
+                out_wear_trends=out_wear_trends,
+            )
+
     @app.timer(interval=timedelta(seconds=_HEARTBEAT_S))
     async def heartbeat():
-        await _emit_rollups(
-            region_id=region_id,
-            assets_latest=assets_latest,
-            emitted=emitted,
-            out_fleet_summary=out_fleet_summary,
-            out_top_factors=out_top_factors,
-            out_wear_trends=out_wear_trends,
-        )
+        await sweep_tick.send(value=b"")
 
     return app
 

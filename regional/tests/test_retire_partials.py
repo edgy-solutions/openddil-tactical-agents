@@ -1,6 +1,7 @@
 """Retirement of emptied rollup partials (compacted topics, upsert key
 includes the class). Offline: fake topics record sends; a dict stands in for
-the emitted Table.
+the emitted Table. The dict cannot enforce Faust's rule that Table writes
+happen inside stream iteration; test_sweep_tick.py uses the real Table.
 
 Run with: pytest regional/tests/test_retire_partials.py -v
 """
