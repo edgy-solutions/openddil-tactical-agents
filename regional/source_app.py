@@ -524,7 +524,7 @@ class _HqProducerService(faust.Service):
                 f"{self._label}: hq producer not started — "
                 "the source App is producing before its sidecar is ready"
             )
-        await self._producer.send_and_wait(
+        await self._producer.send_and_wait(  # produces: ${REGIONAL_FAN_IN_TOPIC:-${OPENDDIL_REGION_ID}-fan-in}
             topic, value=value,
             key=key.encode("utf-8") if isinstance(key, str) else key,
         )

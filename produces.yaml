@@ -1,0 +1,25 @@
+# produces.yaml -- every Kafka topic this repo's workloads can write, as templates over the workload's environment.
+# Checked against the code by tests/test_produces_manifest.py and against the chart by
+# openddil-helm scripts/check-produces-declarations.py.
+workloads:
+  faust-edge:
+    image: openddil/faust-edge
+    topics:
+      - telemetry-latest-state
+      - tactical-events
+      - asset-telemetry-windows
+      - derived-sustainment
+      - "${FAUST_APP_ID:-openddil-edge}-asset_state-changelog"
+      - "${FAUST_APP_ID:-openddil-edge}-prognostics_accumulators-changelog"
+  faust-regional:
+    image: openddil/faust-regional
+    topics:
+      # The code strips a leading "region-" from the id and adds it back, so this default is exact for ids that
+      # start with "region-" (every id the chart renders) and not for others.
+      - "${REGIONAL_FAN_IN_TOPIC:-${OPENDDIL_REGION_ID}-fan-in}"
+      - region-fleet-summary
+      - region-top-factors
+      - region-wear-trends
+      - "region-${OPENDDIL_REGION_ID}-aggregator-region_${OPENDDIL_REGION_ID|us}_assets_latest-changelog"
+      - "region-${OPENDDIL_REGION_ID}-aggregator-region_${OPENDDIL_REGION_ID|us}_emitted_partials-changelog"
+      - "region-${OPENDDIL_REGION_ID}-aggregator-sweep-tick"
