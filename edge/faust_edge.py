@@ -31,6 +31,8 @@ from openddil.logistics.v1 import windowed_telemetry_pb2 as winpb
 from detection.algorithms import REGISTERED, EventView, AssetState, Anomaly
 from detection.units import from_proto
 from element_rollup import rollup_from_envelope
+from element_band_event import build_band_event
+from element_bands import BandTracker, parse_config as parse_band_config
 from detection.windows import (
     Sample,
     build_window_spec,
@@ -218,6 +220,61 @@ samples_since_last_emit: dict[str, int] = {}
 # cache and neither clears what the other contributed.
 element_rollups: dict[str, winpb.ElementRollup] = {}
 _rollup_logged: set[str] = set()
+
+# Element band events (edge/element_bands.py). The band config is rendered
+# into ELEMENT_BANDS_JSON by the chart; absent means off, invalid fails the
+# start (raised at import) rather than falling back to anything.
+def load_band_config(text: str) -> "dict | None":
+    """None (and one log line) when no config was rendered; ValueError when
+    one was rendered but is invalid -- never a fallback."""
+    if not text or not text.strip():
+        logger.info("element band events are off: no band config was "
+                    "rendered (ELEMENT_BANDS_JSON is absent or empty)")
+        return None
+    return parse_band_config(text)
+
+
+band_config = load_band_config(os.getenv("ELEMENT_BANDS_JSON", ""))
+band_tracker = BandTracker(band_config) if band_config else None
+
+
+def band_events_for_envelope(env: dict, tracker, config: dict,
+                             edge_id: str, region_id: str) -> list[dict]:
+    """Band-crossing events for one decoded element envelope. Sample time is
+    the envelope's observed_at_ns (the instant the rollup carries); an
+    envelope without one yields nothing rather than a guessed time. Labels
+    come from the envelope, as for the element window."""
+    aid = env.get("asset_id")
+    obs_ns = env.get("observed_at_ns")
+    elements = env.get("elements")
+    if (not aid or not isinstance(aid, str) or not elements
+            or isinstance(obs_ns, bool) or not isinstance(obs_ns, (int, float))):
+        return []
+    nation = env.get("originator_nation") or ""
+    releasable = env.get("releasable_to") or []
+    if not isinstance(releasable, list):
+        releasable = []
+    releasable = [r for r in releasable if isinstance(r, str)]
+    out = []
+    for el in elements:
+        if not isinstance(el, dict):
+            continue
+        path = el.get("element_id")
+        if not path or not isinstance(path, str):
+            continue
+        for field, spec in config.items():
+            value = el.get(field)
+            crossing = tracker.update(aid, path, field, value)
+            if crossing is None:
+                continue
+            frm, to = crossing
+            out.append(build_band_event(
+                aid, path, el.get("layer_name") or "", field, frm, to,
+                float(value), obs_ns / 1e9, spec["severity"][to],
+                nation if isinstance(nation, str) else "", releasable,
+                edge_id, region_id,
+            ))
+    return out
 
 
 def _emit_window_for_asset(evt: pb.EntityTelemetryEvent,
@@ -460,6 +517,13 @@ async def process_elements(stream):
         w = _window_from_envelope(env, rollup, int(time.time() * 1e9))
         out_bytes = w.SerializeToString()
         await windows_topic.send(key=aid.encode(), value=out_bytes)
+
+        if band_tracker is not None:
+            for ev in band_events_for_envelope(
+                    env, band_tracker, band_config,
+                    OPENDDIL_EDGE_ID, OPENDDIL_REGION_ID):
+                await events_topic.send(
+                    key=aid, value=json.dumps(ev).encode("utf-8"))
 
         if aid not in _rollup_logged:
             _rollup_logged.add(aid)
