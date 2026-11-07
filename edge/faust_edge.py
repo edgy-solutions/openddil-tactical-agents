@@ -47,11 +47,12 @@ import posture as posture_mod
 from posture_event import build_transition_event
 
 logger = logging.getLogger(__name__)
-# Phase 5 prognostics derivation engine — the one-line seam (ADR-0020).
-# `register(app)` below adds the engine's own agent + Table; this is the
-# *only* coupling. To extract the engine into its own service later,
-# delete the import and the call site at the bottom of this file.
-from prognostics import register as register_prognostics
+# Declared analytic units (ADR-0034, first slice; wear is the ADR-0020
+# prognostics engine as one). `register(app)` below adds each enabled unit's
+# own agent + Table; this is the *only* coupling. To extract the runner into
+# its own service later, delete the import and the call site at the bottom of
+# this file.
+from algorithm_runtime.runner import register as register_algorithms
 
 # ADR-0023 §Faust-edge: per-edge instance gets a distinct FAUST_APP_ID so
 # each instance's consumer groups + changelog topics are namespaced per
@@ -689,7 +690,7 @@ async def process(stream):
         rec.temp_ewma_alpha = st.temp_ewma_alpha
         asset_state[aid] = rec
 
-register_prognostics(app)
+register_algorithms(app)
 
 if __name__ == "__main__":
     app.main()
