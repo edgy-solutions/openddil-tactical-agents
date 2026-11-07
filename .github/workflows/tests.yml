@@ -56,3 +56,9 @@ jobs:
         run: |
           pip install jsonschema
           python -m pytest -q tests
+      # The offline replay harness, on synthetic recordings with the frozen
+      # oracle playing production (includes the 200k-record memory bound).
+      - name: replay harness
+        env:
+          PYTHONPATH: ${{ github.workspace }}/openddil-contracts/gen/python
+        run: python -m pytest -q tests/test_replay.py
