@@ -1,0 +1,20 @@
+# FROZEN: copied from edge/prognostics at the parent commit (dec4773), test oracle only.
+# Imported by the equivalence test and the replay harness, never edited. The only
+# change from the original is the import root, prognostics -> prognostics_v0.
+"""OpenDDIL Phase 5 — Prognostics Derivation Engine (see ADR-0020).
+
+`register(app)` is the one-line seam: faust_edge.py imports it and calls
+it once at app load. Everything else is purposely contained:
+  - `coefficients.py` — authored placeholder constants (env-overridable)
+  - `accumulators.py` — pure per-asset state + observation folding
+  - `models.py`        — the four wear models (rules.py mold)
+  - `agent.py`         — the ONLY file that imports faust; owns the Table
+
+Phase 5 demonstrates the *mechanism* on synthetic data — see ADR-0020 for
+what this engine claims (pipeline works end-to-end) and what it does not
+(numbers are accurate). Validation against measured ground truth is the
+deferred AFSIM or co-located-simulator phase.
+"""
+from prognostics_v0.agent import register  # noqa: F401
+
+__all__ = ["register"]
