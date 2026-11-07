@@ -1,0 +1,48 @@
+apiVersion: openddil.io/algorithm/v1
+unit: wear
+version: "1.0.0"
+runtime: stream-parallel          # ADR-0034 execution class; the only one this runner accepts
+entrypoint: wear.py:Wear
+key: asset_id
+composition: propagating          # ADR-0034 composition typing
+inputs:
+  topic: raw-sensor-stream
+  roles:
+    - {role: position_ecef_m, required: true}
+    - {role: pitch_deg}
+    - {role: roll_deg}
+    - {role: sample_time_ns, required: true}
+params:                            # every tunable constant; defaults = the original engine's values
+  track_life_total_km:          {type: number,  default: 5000,   minimum: 0, unit: km}
+  engine_life_total_hours:      {type: number,  default: 5000,   minimum: 0, unit: h}
+  barrel_life_total_rounds:     {type: integer, default: 1000,   minimum: 0, unit: "1"}
+  terrain_total_deg_km:         {type: number,  default: 100000, minimum: 0, unit: deg.km}
+  critical_fraction:            {type: number,  default: 1.0,    minimum: 0}
+  service_due_fraction:         {type: number,  default: 0.9,    minimum: 0}
+  degraded_fraction:            {type: number,  default: 0.5,    minimum: 0}
+state:
+  table: prognostics_accumulators
+  partitions: 1
+  # The changelog's records carry this namespace; keeping it means a restart
+  # replays the existing changelog into the generated class.
+  record_namespace: prognostics.agent._AccumulatorRecord
+  fields:                          # ORDER and names = the original record's
+    cumulative_distance_m:   {type: number,  default: 0.0}
+    observed_time_first_ns:  {type: integer, default: 0}
+    observed_time_last_ns:   {type: integer, default: 0}
+    terrain_integral_deg_km: {type: number,  default: 0.0}
+    rounds_fired:            {type: integer, default: 0}
+    last_ecef_x:             {type: number,  nullable: true, default: null}
+    last_ecef_y:             {type: number,  nullable: true, default: null}
+    last_ecef_z:             {type: number,  nullable: true, default: null}
+    last_pitch_deg:          {type: number,  nullable: true, default: null}
+    last_roll_deg:           {type: number,  nullable: true, default: null}
+outputs:
+  - kind: sustainment              # EntityTelemetryEvent.sustainment
+    topic: derived-sustainment
+    direction: local               # local | upward; terminal + upward is refused
+    producer_id: prognostics-derivation
+    source_protocol: openddil.prognostics.v1
+    labels: copy-source            # the only accepted value until ADR-0055 (high-water)
+resources: {memory_mi: 16, cpu_m: 20}
+dependencies: []                   # must be empty: dependencies ship in the image, never fetched
