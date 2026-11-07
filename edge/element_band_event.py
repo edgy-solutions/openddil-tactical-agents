@@ -25,11 +25,13 @@ and releasable_to is only meaningful alongside an originator nation.
 """
 from __future__ import annotations
 
+import json
 import uuid
 from datetime import datetime, timezone
 from typing import Sequence
 
 EVENT_TYPE = "openddil.element.band"
+COUNT_EVENT_TYPE = "openddil.element.bandcount"
 
 
 def _rfc3339(t: float) -> str:
@@ -80,6 +82,64 @@ def build_band_event(
         )),
         "source": f"openddil/edge/{edge_id}/{asset_id}",
         "type": EVENT_TYPE,
+        "subject": asset_id,
+        "time": at_s,
+        "datacontenttype": "application/json",
+        "data": data,
+    }
+
+
+def build_band_count_event(
+    asset_id: str,
+    field: str,
+    counts: dict,
+    by_layer: dict,
+    crossings: dict,
+    elements: int,
+    delta: "dict | None",
+    baseline: bool,
+    at: float,
+    severity: str,
+    originator_nation: str,
+    releasable_to: Sequence[str],
+    edge_id: str,
+    region_id: str,
+) -> dict:
+    """One per asset per field per envelope that moved a band: absolute counts
+    per band (and per layer), the crossings behind them, and the delta against
+    the last emission. `baseline` marks the first emission after a start, which
+    has no delta. Labels follow build_band_event: absent stays absent."""
+    if not baseline and delta is None:
+        raise ValueError("delta is required unless baseline is True")
+    at_ns = int(round(at * 1e9))
+    at_s = _rfc3339(at)
+    canon = json.dumps(counts, sort_keys=True, separators=(",", ":"))
+    data = {
+        "asset_id": asset_id,
+        "field": field,
+        "at": at_s,
+        "counts": counts,
+        "by_layer": by_layer,
+        "crossings": crossings,
+        "elements": elements,
+        "severity": severity,
+        "edge_id": edge_id,
+        "region_id": region_id,
+        "baseline": bool(baseline),
+    }
+    if not baseline:
+        data["delta"] = delta
+    if originator_nation:
+        data["originator_nation"] = originator_nation
+        data["releasable_to"] = list(releasable_to)
+    return {
+        "specversion": "1.0",
+        "id": str(uuid.uuid5(
+            uuid.NAMESPACE_URL,
+            f"openddil:element-bandcount:{asset_id}:{field}:{at_ns}:{canon}",
+        )),
+        "source": f"openddil/edge/{edge_id}/{asset_id}",
+        "type": COUNT_EVENT_TYPE,
         "subject": asset_id,
         "time": at_s,
         "datacontenttype": "application/json",

@@ -19,7 +19,8 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from element_band_event import EVENT_TYPE, build_band_event  # noqa: E402
+from element_band_event import (  # noqa: E402
+    COUNT_EVENT_TYPE, EVENT_TYPE, build_band_count_event, build_band_event)
 from element_bands import BandTracker, parse_config  # noqa: E402
 
 GOLDEN_ID = "eb39f2b1-78f8-5ec7-88fa-c6cacc881f38"
@@ -189,3 +190,47 @@ def test_wiring_one_event_from_two_envelopes():
     assert d["element_path"] == "e1" and d["layer_name"] == "psu"
     assert d["originator_nation"] == "ATL" and d["releasable_to"] == ["BDR"]
     assert ev["time"] == "1970-01-01T00:00:02.000000+00:00"
+
+
+# build_band_count_event and BandTracker.band
+COUNT_GOLDEN_ID = "9dee5152-1928-50d0-ac4a-0938a41f9c59"
+_C = {"ok": 1, "degraded": 2, "critical": 0}
+
+
+def _cev(nation="", rel=(), baseline=True, delta=None):
+    return build_band_count_event(
+        "asset-1", "health", _C, {"psu": _C}, {"ok>degraded": 2}, 3, delta,
+        baseline, 100.0, "warn", nation, rel, "edge-01", "region-01")
+
+
+def test_count_golden_id():
+    assert _cev()["id"] == COUNT_GOLDEN_ID
+
+
+def test_count_envelope_and_data():
+    ev = _cev()
+    assert ev["type"] == COUNT_EVENT_TYPE == "openddil.element.bandcount"
+    assert ev["source"] == "openddil/edge/edge-01/asset-1"
+    assert ev["time"] == ev["data"]["at"] == "1970-01-01T00:01:40.000000+00:00"
+    d = ev["data"]
+    assert d["baseline"] is True and "delta" not in d
+    assert d["counts"] == _C and d["by_layer"] == {"psu": _C} and d["elements"] == 3
+    assert "originator_nation" not in d
+    d2 = _cev(nation="ATL", rel=("BDR",), baseline=False, delta={"ok": 1})["data"]
+    assert d2["baseline"] is False and d2["delta"] == {"ok": 1}
+    assert d2["originator_nation"] == "ATL" and d2["releasable_to"] == ["BDR"]
+
+
+def test_count_needs_delta_unless_baseline():
+    with pytest.raises(ValueError):
+        _cev(baseline=False, delta=None)
+
+
+def test_tracker_band_name():
+    t = BandTracker(CFG)
+    assert t.band("a", "e", "health") is None
+    t.update("a", "e", "health", 0.5)
+    assert t.band("a", "e", "health") == "ok"
+    t.update("a", "e", "health", 0.99)
+    assert t.band("a", "e", "health") == "critical"
+    assert t.band("a", "e", "temp_c") is None

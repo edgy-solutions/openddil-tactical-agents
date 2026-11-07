@@ -87,3 +87,12 @@ class BandTracker:
             return None
         self._band[key] = new
         return names[old], names[new]
+
+    def band(self, asset_id: str, element_path: str, field: str) -> Optional[str]:
+        """Current band name for the key, or None if never observed (or the
+        field is not configured)."""
+        spec = self._cfg.get(field)
+        idx = self._band.get((asset_id, element_path, field))
+        if spec is None or idx is None:
+            return None
+        return spec["names"][idx]
