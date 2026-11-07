@@ -168,6 +168,28 @@ def test_clean_recording_has_no_differences(tmp_path):
     assert r.topics == {"raw-sensor-stream": rec.n - rec.start, "derived-sustainment": rec.n - rec.start}
 
 
+def test_callsign_cleared_mid_recording_is_not_a_difference(tmp_path):
+    """A recording may clear the callsign from some pull on. Raw and derived are pulled
+    separately, so one side can carry it where the other doesn't, in either direction."""
+    rec = Recording()
+
+    def cleared(rows, from_k):
+        out = []
+        for k, (off, ts, key, value) in enumerate(rows):
+            if k >= from_k:
+                msg = pb.EntityTelemetryEvent.FromString(value)
+                msg.asset.ClearField("callsign")
+                value = msg.SerializeToString()
+            out.append((off, ts, key, value))
+        return out
+
+    rec.rec_rows = cleared(rec.rec_rows, 100)
+    rec.raw_rows = cleared(rec.raw_rows, 120)
+    r = run_api(rec.write(tmp_path))
+    assert r.compared > 100 and r.different == 0 and r.unaligned == 0
+    assert (r.replay_only, r.recorded_only) == (0, 0)
+
+
 def test_one_ulp_names_field_path_and_offset(tmp_path):
     rec = Recording()
     k = 110  # well after the alignment point

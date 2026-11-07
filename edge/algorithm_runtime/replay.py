@@ -152,10 +152,12 @@ def load_snapshot(paths: Iterable, decl: Declaration) -> dict[str, dict]:
 # --------------------------------------------------------------------------
 def _norm(msg: pb.EntityTelemetryEvent, src_has_sample_time: bool) -> pb.EntityTelemetryEvent:
     """Copy with what is allowed to differ cleared: ids, wall-clock stamps,
-    the new producer_stamp, and sample_time only where the source had none."""
+    the new producer_stamp, sample_time only where the source had none, and the
+    callsign, a label no unit reads that a recording may clear from some pull on."""
     out = pb.EntityTelemetryEvent()
     out.CopyFrom(msg)
     out.ClearField("event_id")
+    out.asset.ClearField("callsign")
     out.provenance.ClearField("ingest_time")
     out.provenance.ClearField("producer_stamp")
     if not src_has_sample_time:
