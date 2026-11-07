@@ -128,18 +128,14 @@ class _Fake:
         self.sent.append((key, value))
 
 
-LABEL = ("ATL", ["BDR"])
-
-
-def _run(envs, *, config, label=LABEL, state=None):
-    """Drive process_elements. `state` carries tracker/_last_counts/asset_labels
-    across calls (a restart is a fresh state). Returns (events on the env
-    topic, the fakes, the state)."""
+def _run(envs, *, config, state=None):
+    """Drive process_elements. `state` carries tracker/_last_counts across
+    calls (a restart is a fresh state). Returns (events on the env topic, the
+    fakes, the state)."""
     import faust_edge
     ev_t, win_t, band_t = _Fake(), _Fake(), _Fake()
     if state is None:
-        state = {"tracker": BandTracker(config) if config else None,
-                 "last": {}, "labels": {} if label is None else {"a1": label}}
+        state = {"tracker": BandTracker(config) if config else None, "last": {}}
 
     async def stream():
         for e in envs:
@@ -152,12 +148,8 @@ def _run(envs, *, config, label=LABEL, state=None):
         mp.setattr(faust_edge, "element_band_topic", band_t)
         mp.setattr(faust_edge, "band_config", config)
         mp.setattr(faust_edge, "band_tracker", state["tracker"])
-        mp.setattr(faust_edge, "asset_labels", state["labels"])
         mp.setattr(faust_edge, "_last_counts", state["last"])
         mp.setattr(faust_edge, "_band_sent", {"element": 0, "count": 0})
-        mp.setattr(faust_edge, "_band_refused", {
-            (k, r): 0 for k in ("element", "count")
-            for r in ("no_label_record", "label_record_unlabelled")})
         asyncio.run(faust_edge.process_elements.fun(stream()))
         state["metrics"] = faust_edge.render_metrics()
     finally:
@@ -208,10 +200,10 @@ def test_wiring_one_event_from_two_envelopes():
     d = ev["data"]
     assert (d["from"], d["to"], d["severity"]) == ("ok", "critical", "crit")
     assert d["element_path"] == "e1" and d["layer_name"] == "psu"
-    # the tier label, not the envelope's ZZZ
-    assert d["originator_nation"] == "ATL" and d["releasable_to"] == ["BDR"]
+    # no label, not the envelope's ZZZ: each tier's projector labels the row
+    assert "originator_nation" not in d and "releasable_to" not in d
     assert ev["time"] == "1970-01-01T00:00:02.000000+00:00"
-    assert sent[0]["data"]["originator_nation"] == "ATL"
+    assert "originator_nation" not in sent[0]["data"]
 
 
 def _big(t_s, n_deg, n_crit, n=2000):
@@ -281,28 +273,42 @@ def test_restart():
     assert sent3 == [] and ev3.band.sent == []
 
 
-def test_refusal_no_label_record():
-    sent, ev_t, _, st = _run(_p22(), config=CFG, label=None)
-    assert sent == [] and ev_t.band.sent == []
+def test_sent_with_no_label():
+    sent, ev_t, _, st = _run(_p22(), config=CFG)
+    assert len(ev_t.band.sent) == 1869 and len(sent) == 1
+    for ev in sent + [json.loads(v) for _, v in ev_t.band.sent]:
+        assert "originator_nation" not in ev["data"]
+        assert "releasable_to" not in ev["data"]
     m = _metrics(st["metrics"])
-    ref = "openddil_element_band_refused_total"
-    assert m[(ref, (("kind", "element"), ("reason", "no_label_record")))] == 1869
-    assert m[(ref, (("kind", "count"), ("reason", "no_label_record")))] == 1
-    assert st["last"] == {}
-    # label arrives: next count event is a baseline (nothing was written)
-    st["labels"]["a1"] = LABEL
-    sent2, ev2, _, _ = _run([_env3()], config=CFG, state=st)
-    assert len(sent2) == 1 and sent2[0]["data"]["baseline"] is True
+    sent_total = "openddil_element_band_events_total"
+    assert m[(sent_total, (("kind", "element"),))] == 1869
+    assert m[(sent_total, (("kind", "count"),))] == 1
+    # written after the send: the next count event carries a delta
+    assert st["last"] == {("a1", "health"): {"ok": 131, "degraded": 1753, "critical": 116}}
+    sent2, _, _, _ = _run([_env3()], config=CFG, state=st)
+    assert len(sent2) == 1 and sent2[0]["data"]["baseline"] is False
 
 
-def test_refusal_unlabelled():
-    sent, ev_t, _, st = _run(_p22(), config=CFG, label=("", []))
-    assert sent == [] and ev_t.band.sent == []
-    m = _metrics(st["metrics"])
-    ref = "openddil_element_band_refused_total"
-    assert m[(ref, (("kind", "element"), ("reason", "label_record_unlabelled")))] == 1869
-    assert m[(ref, (("kind", "count"), ("reason", "label_record_unlabelled")))] == 1
-    assert m[(ref, (("kind", "count"), ("reason", "no_label_record")))] == 0
+def test_sent_with_no_label_when_the_envelope_carries_one():
+    # The envelope's label is never a label source for band events.
+    env = _env(2, 0.99)
+    sent, ev_t, _, _ = _run([_env(1, 0.5), env], config=CFG)
+    assert env["originator_nation"] == "ZZZ"
+    assert len(sent) == 1 and len(ev_t.band.sent) == 1
+    assert "originator_nation" not in sent[0]["data"]
+    assert "originator_nation" not in json.loads(ev_t.band.sent[0][1])["data"]
+
+
+def test_asset_with_no_raw_record_still_sends_its_crossing_count():
+    # The raw-sensor path never handled asset-b; its count is sent anyway.
+    envs = [dict(_env(1, 0.5), asset_id="asset-b"),
+            dict(_env(2, 0.99), asset_id="asset-b")]
+    sent, ev_t, _, st = _run(envs, config=CFG)
+    assert [e["type"] for e in sent] == [COUNT_EVENT_TYPE]
+    assert sent[0]["subject"] == "asset-b"
+    assert sent[0]["data"]["crossings"] == {"ok>critical": 1}
+    assert ev_t.band.sent[0][0] == "asset-b"
+    assert ("asset-b", "health") in st["last"]
 
 
 def test_routing_selection():
@@ -331,14 +337,11 @@ def test_exporter_series_and_page():
     import faust_edge
     _, _, _, st = _run(_p22(), config=CFG)
     m = _metrics(st["metrics"])
-    assert len(m) == 6
+    assert len(m) == 2
     sent = "openddil_element_band_events_total"
     assert m[(sent, (("kind", "element"),))] == 1869
     assert m[(sent, (("kind", "count"),))] == 1
-    ref = "openddil_element_band_refused_total"
-    for k in ("element", "count"):
-        for r in ("no_label_record", "label_record_unlabelled"):
-            assert m[(ref, (("kind", k), ("reason", r)))] == 0
+    assert "openddil_element_band_refused_total" not in st["metrics"]
     assert "/metrics" in faust_edge.app.web.views
 
 
