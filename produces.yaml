@@ -7,6 +7,7 @@ workloads:
     topics:
       - telemetry-latest-state
       - tactical-events
+      - "${ELEMENT_BAND_EVENTS_TOPIC:-tactical-events}"
       - asset-telemetry-windows
       - derived-sustainment
       - "${FAUST_APP_ID:-openddil-edge}-asset_state-changelog"

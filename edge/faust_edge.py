@@ -31,7 +31,7 @@ from openddil.logistics.v1 import windowed_telemetry_pb2 as winpb
 from detection.algorithms import REGISTERED, EventView, AssetState, Anomaly
 from detection.units import from_proto
 from element_rollup import rollup_from_envelope
-from element_band_event import build_band_event
+from element_band_event import build_band_event, build_band_count_event
 from element_bands import BandTracker, parse_config as parse_band_config
 from detection.windows import (
     Sample,
@@ -237,44 +237,123 @@ def load_band_config(text: str) -> "dict | None":
 band_config = load_band_config(os.getenv("ELEMENT_BANDS_JSON", ""))
 band_tracker = BandTracker(band_config) if band_config else None
 
+# The tier's label for an asset: provenance on the latest raw-sensor-stream
+# record this process handled for it (the record that becomes this tier's
+# telemetry_latest_state row). Band output takes this label, never the
+# envelope's.
+asset_labels: dict[str, tuple[str, list[str]]] = {}
+# Counts last sent per (asset, field); written only after a successful send.
+_last_counts: dict[tuple[str, str], dict] = {}
+
+ELEMENT_BAND_EVENTS_TOPIC = os.getenv("ELEMENT_BAND_EVENTS_TOPIC", "tactical-events")
+
+
+def select_element_band_topic(name: str):
+    """Per-element band events go to `name`; tactical-events is today's routing."""
+    if name == "tactical-events":
+        return events_topic
+    return app.topic(name, value_type=bytes)
+
+
+element_band_topic = select_element_band_topic(ELEMENT_BAND_EVENTS_TOPIC)
+
+_REFUSE_REASONS = ("no_label_record", "label_record_unlabelled")
+_band_sent = {"element": 0, "count": 0}
+_band_refused = {(k, r): 0 for k in ("element", "count") for r in _REFUSE_REASONS}
+_refusal_logged: set[tuple[str, str]] = set()
+
+
+def render_metrics() -> str:
+    """Prometheus text format 0.0.4 for the band counters."""
+    lines = [
+        "# HELP openddil_element_band_events_total Element band events faust-edge sent, by kind.",
+        "# TYPE openddil_element_band_events_total counter",
+    ]
+    for kind in ("element", "count"):
+        lines.append(f'openddil_element_band_events_total{{kind="{kind}"}} {_band_sent[kind]}')
+    lines += [
+        "# HELP openddil_element_band_refused_total Element band events faust-edge refused for want of a tier label.",
+        "# TYPE openddil_element_band_refused_total counter",
+    ]
+    for kind in ("element", "count"):
+        for reason in _REFUSE_REASONS:
+            lines.append(
+                f'openddil_element_band_refused_total{{kind="{kind}",reason="{reason}"}} '
+                f'{_band_refused[(kind, reason)]}')
+    return "\n".join(lines) + "\n"
+
+
+@app.page("/metrics")
+async def metrics_page(self, request):
+    return self.text(render_metrics(), content_type="text/plain; version=0.0.4")
+
 
 def band_events_for_envelope(env: dict, tracker, config: dict,
-                             edge_id: str, region_id: str) -> list[dict]:
-    """Band-crossing events for one decoded element envelope. Sample time is
-    the envelope's observed_at_ns (the instant the rollup carries); an
-    envelope without one yields nothing rather than a guessed time. Labels
-    come from the envelope, as for the element window."""
+                             edge_id: str, region_id: str,
+                             labels: "tuple[str, list[str]]"
+                             ) -> "tuple[list[dict], list[dict]]":
+    """(element_events, count_events) for one decoded element envelope. Sample
+    time is the envelope's observed_at_ns; an envelope without one yields
+    nothing rather than a guessed time. `labels` is the tier's (nation,
+    releasable) for the asset, possibly empty; the envelope's own label is
+    never read. Does not write _last_counts: the caller does, after sending."""
     aid = env.get("asset_id")
     obs_ns = env.get("observed_at_ns")
     elements = env.get("elements")
     if (not aid or not isinstance(aid, str) or not elements
             or isinstance(obs_ns, bool) or not isinstance(obs_ns, (int, float))):
-        return []
-    nation = env.get("originator_nation") or ""
-    releasable = env.get("releasable_to") or []
-    if not isinstance(releasable, list):
-        releasable = []
-    releasable = [r for r in releasable if isinstance(r, str)]
+        return [], []
+    nation, releasable = labels
     out = []
+    seen: list[tuple[str, str]] = []  # (layer, path) of valid elements
+    crossed: dict[str, dict[str, int]] = {f: {} for f in config}
     for el in elements:
         if not isinstance(el, dict):
             continue
         path = el.get("element_id")
         if not path or not isinstance(path, str):
             continue
+        seen.append((el.get("layer_name") or "", path))
         for field, spec in config.items():
             value = el.get(field)
             crossing = tracker.update(aid, path, field, value)
             if crossing is None:
                 continue
             frm, to = crossing
+            key = f"{frm}>{to}"
+            crossed[field][key] = crossed[field].get(key, 0) + 1
             out.append(build_band_event(
                 aid, path, el.get("layer_name") or "", field, frm, to,
                 float(value), obs_ns / 1e9, spec["severity"][to],
-                nation if isinstance(nation, str) else "", releasable,
-                edge_id, region_id,
+                nation, releasable, edge_id, region_id,
             ))
-    return out
+    count_events = []
+    for field, spec in config.items():
+        names = spec["names"]
+        counts = {n: 0 for n in names}
+        by_layer: dict[str, dict] = {}
+        total = 0
+        for layer, path in seen:
+            b = tracker.band(aid, path, field)
+            if b is None:
+                continue
+            counts[b] += 1
+            by_layer.setdefault(layer, {n: 0 for n in names})[b] += 1
+            total += 1
+        crossings = crossed[field]
+        last = _last_counts.get((aid, field))
+        if not crossings:
+            if last is not None or not any(counts[n] for n in names[1:]):
+                continue
+        baseline = last is None
+        delta = None if baseline else {n: counts[n] - last.get(n, 0) for n in names}
+        worst = max((i for i, n in enumerate(names) if counts[n]), default=0)
+        count_events.append(build_band_count_event(
+            aid, field, counts, by_layer, crossings, total, delta, baseline,
+            obs_ns / 1e9, spec["severity"][names[worst]],
+            nation, releasable, edge_id, region_id,
+        ))
+    return out, count_events
 
 
 def _emit_window_for_asset(evt: pb.EntityTelemetryEvent,
@@ -519,11 +598,32 @@ async def process_elements(stream):
         await windows_topic.send(key=aid.encode(), value=out_bytes)
 
         if band_tracker is not None:
-            for ev in band_events_for_envelope(
-                    env, band_tracker, band_config,
-                    OPENDDIL_EDGE_ID, OPENDDIL_REGION_ID):
-                await events_topic.send(
-                    key=aid, value=json.dumps(ev).encode("utf-8"))
+            lab = asset_labels.get(aid)
+            reason = (None if lab is not None and lab[0]
+                      else "no_label_record" if lab is None
+                      else "label_record_unlabelled")
+            # Always run: the tracker must stay current while refused.
+            element_events, count_events = band_events_for_envelope(
+                env, band_tracker, band_config,
+                OPENDDIL_EDGE_ID, OPENDDIL_REGION_ID, lab or ("", []))
+            if reason:
+                _band_refused[("element", reason)] += len(element_events)
+                _band_refused[("count", reason)] += len(count_events)
+                if element_events or count_events:
+                    first = (aid, reason) not in _refusal_logged
+                    _refusal_logged.add((aid, reason))
+                    (logger.info if first else logger.debug)(
+                        "element band output refused for %s: %s", aid, reason)
+            else:
+                for ev in element_events:
+                    await element_band_topic.send(  # produces: ${ELEMENT_BAND_EVENTS_TOPIC:-tactical-events}
+                        key=aid, value=json.dumps(ev).encode("utf-8"))
+                    _band_sent["element"] += 1
+                for ev in count_events:
+                    await events_topic.send(
+                        key=aid, value=json.dumps(ev).encode("utf-8"))
+                    _last_counts[(aid, ev["data"]["field"])] = ev["data"]["counts"]
+                    _band_sent["count"] += 1
 
         if aid not in _rollup_logged:
             _rollup_logged.add(aid)
@@ -550,6 +650,9 @@ async def process(stream):
             continue
 
         aid = evt.asset.asset_id
+        if aid:
+            asset_labels[aid] = (evt.provenance.originator_nation,
+                                 list(evt.provenance.releasable_to))
 
         # Load state once per record -- carries both the anomaly-detection
         # rolling state (below) and the posture state machine's state
