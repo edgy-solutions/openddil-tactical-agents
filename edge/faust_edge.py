@@ -2,12 +2,10 @@
 # ADR-0007: Dual-path streaming architecture.
 # Migration target is Quix Streams for sub-10ms p99 latency and native
 # Protobuf+Schema Registry support. Faust is current; Quix is planned.
-# DO NOT leak Faust types (faust.Record, faust.Stream, App) into algorithms.py
-# or detection/units.py. The boundary is EventView/AssetState/Anomaly only.
+# DO NOT leak Faust types (faust.Record, faust.Stream, App) into
+# detection/units.py or the declared units.
 # =============================================================================
 import json
-import uuid
-from datetime import datetime, timezone
 
 """
 OpenDDIL Faust Edge Agent
@@ -28,8 +26,6 @@ from typing import Optional
 import faust
 from openddil.telemetry.v1 import telemetry_pb2 as pb
 from openddil.logistics.v1 import windowed_telemetry_pb2 as winpb
-from detection.algorithms import REGISTERED, EventView, AssetState, Anomaly
-from detection.units import from_proto
 from element_rollup import rollup_from_envelope
 from element_band_event import build_band_event
 from element_bands import BandTracker, parse_config as parse_band_config
@@ -41,14 +37,14 @@ from detection.windows import (
     trend_to_proto,
 )
 # ADR-0044 amendment ("posture, a third column") -- a pure sibling module,
-# no Faust/proto types (same boundary discipline as detection/algorithms.py).
+# no Faust/proto types (same boundary discipline as detection/units.py).
 # Aliased so the StateRecord field named `posture` below never shadows it.
 import posture as posture_mod
 from posture_event import build_transition_event
 
 logger = logging.getLogger(__name__)
 # Declared analytic units (ADR-0034, first slice; wear is the ADR-0020
-# prognostics engine as one). `register(app)` below adds each enabled unit's
+# prognostics engine as one, thermal the runaway rule as another). `register(app)` below adds each enabled unit's
 # own agent + Table; this is the *only* coupling. To extract the runner into
 # its own service later, delete the import and the call site at the bottom of
 # this file.
@@ -163,6 +159,9 @@ DEQUE_CAP = int(os.getenv("WINDOW_DEQUE_CAP", "4096"))
 
 # Faust-managed state record for RocksDB serialization.
 class StateRecord(faust.Record):
+    # The three thermal fields are no longer written (thermal runs as the
+    # declared unit `thermal`, with its own table); they stay so the existing
+    # asset_state changelog still decodes.
     last_temp_k: float = 0.0
     temp_ewma_k: float = 0.0
     temp_ewma_alpha: float = 0.2
@@ -187,18 +186,6 @@ asset_state = app.Table(
     # the second Table.
     partitions=1,
 )
-
-def _build_view(evt: pb.EntityTelemetryEvent) -> EventView:
-    """Project proto -> algorithm-friendly view. Single conversion point."""
-    return EventView(
-        asset_id=evt.asset.asset_id,
-        sample_time_ns=evt.kinematics.position.valid_at.ToNanoseconds(),
-        component_temp=from_proto(evt.sustainment.thermal.component_temperature),
-        ambient_temp=from_proto(evt.sustainment.thermal.ambient_temperature),
-        ground_speed=from_proto(evt.kinematics.velocity.ground_speed),
-        fuel_remaining=from_proto(evt.sustainment.fluids.fuel_remaining),
-        bus_voltage=from_proto(evt.sustainment.power.bus_voltage),
-    )
 
 # ---------------------------------------------------------------------------
 # Rolling-window state — per-process in-memory buffers (Phase 3.5).
@@ -552,9 +539,8 @@ async def process(stream):
 
         aid = evt.asset.asset_id
 
-        # Load state once per record -- carries both the anomaly-detection
-        # rolling state (below) and the posture state machine's state
-        # (ADR-0044 amendment), read and written together.
+        # Load the posture state machine's state (ADR-0044 amendment) once
+        # per record, read and written together.
         rec = asset_state[aid]
 
         # 0. Posture state machine (ADR-0044 amendment, "posture, a third
@@ -640,54 +626,7 @@ async def process(stream):
                         value=w.SerializeToString(),
                     )
 
-        # 2. Anomaly Detection Pipeline
-        view = _build_view(evt)
-
-        # rec was already loaded above (shared with the posture state
-        # machine) -> Convert to Algo State (AssetState)
-        st = AssetState(
-            last_temp_k=rec.last_temp_k,
-            temp_ewma_k=rec.temp_ewma_k,
-            temp_ewma_alpha=rec.temp_ewma_alpha
-        )
-
-        for algo in REGISTERED:
-            anomaly = algo(view, st)
-            if anomaly:
-                # Convert Anomaly dataclass to CloudEvent-ish JSON for tactical-events
-                ce = {
-                    "specversion": "1.0",
-                    "id": str(uuid.uuid4()),
-                    # ADR-0023 §Faust-edge: source carries edge-id so a
-                    # tactical-event handler that ever reads provenance
-                    # sees it without a separate field-shape upgrade.
-                    "source": f"openddil/edge/{OPENDDIL_EDGE_ID}/{view.asset_id}",
-                    "type": f"openddil.anomaly.{anomaly.rule_id}",
-                    "subject": view.asset_id,
-                    "time": datetime.now(timezone.utc).isoformat(),
-                    "datacontenttype": "application/json",
-                    "data": {
-                        "severity": anomaly.severity,
-                        "summary": anomaly.summary,
-                        "evidence": anomaly.evidence,
-                        # 6a shape-now-fill-later: tactical_events handler
-                        # still uses env-default in 6a; 6b upgrade reads
-                        # these. Stamping now so the data is on the wire.
-                        "edge_id": OPENDDIL_EDGE_ID,
-                        "region_id": OPENDDIL_REGION_ID,
-                    }
-                }
-                await events_topic.send(
-                    key=view.asset_id,
-                    value=json.dumps(ce).encode('utf-8')
-                )
-
-        # Sync back to Table. One write carrying both the anomaly-detection
-        # state (AssetState -> StateRecord) and the posture fields already
-        # set on `rec` above -- one read, one write, per record.
-        rec.last_temp_k = st.last_temp_k or 0.0
-        rec.temp_ewma_k = st.temp_ewma_k or 0.0
-        rec.temp_ewma_alpha = st.temp_ewma_alpha
+        # One write per record: the posture fields set on `rec` above.
         asset_state[aid] = rec
 
 register_algorithms(app)
