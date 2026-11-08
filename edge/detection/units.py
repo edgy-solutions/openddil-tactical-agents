@@ -15,6 +15,7 @@ ureg.default_format = "~"   # short symbol form
 
 # UCUM uses "[degF]" but pint uses "degF". Bridge the dialect.
 _UCUM_TO_PINT = {
+    "Cel": "degC",
     "[degF]": "degF",
     "[kn_i]": "knot",
     "gal_us": "gallon",

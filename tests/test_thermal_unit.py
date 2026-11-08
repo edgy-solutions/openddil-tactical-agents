@@ -261,6 +261,35 @@ def test_a_temperature_role_is_absent_unless_the_source_set_it():
     assert "role_unconvertible" not in out
 
 
+# e. roles.extract: on the old table "Cel" left the role absent and counted role_unconvertible.
+def test_a_cel_temperature_role_is_present_in_kelvin():
+    import detection.units as units
+    evt = make_event("a-1", (92.0, "Cel"), (20.0, "Cel"))
+    out = roles.extract(evt, {"component_temp_k", "ambient_temp_k"})
+    assert "role_unconvertible" not in out
+    want = units.from_proto(evt.sustainment.thermal.component_temperature).to("kelvin").magnitude
+    assert out["component_temp_k"] == want == pytest.approx(365.15)
+    assert out["ambient_temp_k"] == pytest.approx(293.15)
+
+
+# f. core.process_one: on the old table a "Cel" sample was skipped (no state write, no alert).
+def test_a_celsius_ramp_fires_runaway_in_kelvin_and_writes_state():
+    unit, decl = make_thermal()
+    state = None
+    sends = []
+    for comp in (110.0, 115.0):
+        evt = make_event("a-1", (comp, "Cel"), (20.0, "Cel"))
+        state, sends, counters = core.process_one(unit, decl, evt.SerializeToString(), state)
+        assert state is not None and "role_unconvertible" not in counters
+    assert len(sends) == 1
+    topic, _key, msg = sends[0]
+    assert topic == "tactical-events"
+    ev = json.loads(outputs.encode(msg))
+    assert ev["type"] == "openddil.anomaly.thermal.runaway.v1"
+    assert state["last_temp_k"] == pytest.approx(388.15)
+    assert ev["data"]["evidence"]["component_temp_k"] == pytest.approx(388.15)
+
+
 # --- count-only replay ---------------------------------------------------------------
 def _raw_rows(n):
     rows = []

@@ -31,7 +31,7 @@ N_SAMPLES = 6_000
 
 
 def to_unit(kelvin: float, unit: str) -> float:
-    if unit == "degC":
+    if unit in ("degC", "Cel"):
         return kelvin - 273.15
     if unit == "[degF]":
         return (kelvin - 273.15) * 9.0 / 5.0 + 32.0
@@ -216,6 +216,11 @@ HAND = [
                                           make_event("hand", (400.0, "K"), (0.0, ""))], 0),
     ("value 0.0 with unit degC is present", [make_event("hand", (0.0, "degC"), (0.0, "degC")),
                                             make_event("hand", (100.0, "degC"), (0.0, "degC"))], 1),
+    # g. the frozen oracle's glue calls the live from_proto; on the old table it raised on "Cel"
+    ("Cel ramp fires, oracle and unit agree", [make_event("hand", (110.0, "Cel"), (20.0, "Cel")),
+                                              make_event("hand", (115.0, "Cel"), (20.0, "Cel"))], 1),
+    ("Cel just under the delta does not fire", [make_event("hand", (96.0, "Cel"), (20.0, "Cel")),
+                                               make_event("hand", (99.0, "Cel"), (20.0, "Cel"))], 0),
     ("an asset with no thermal at all", [make_event("hand"), make_event("hand")], 0),
     ("unlabelled source", [make_event("hand", (300.0, "K"), (200.0, "K")),
                            make_event("hand", (310.0, "K"), (200.0, "K"))], 1),
@@ -235,9 +240,8 @@ def test_hand_cases(pinned, name, events, fires):
 
 
 # --- readings the old path could not survive ------------------------------------
-# "Cel" is UCUM's name for degrees Celsius but not pint's: detection.units has no bridge for it (only [degF] and a few
-# others), so the original path raised on it too. It is unconvertible here by the same rule, and counted.
-@pytest.mark.parametrize("unit", ["1", "m", "no_such_unit", "Cel"])
+# ("Cel", UCUM's Celsius, is no longer here: detection.units bridges it, so it is a compared unit; see HAND.)
+@pytest.mark.parametrize("unit", ["1", "m", "no_such_unit"])
 def test_an_unconvertible_unit_is_skipped_and_counted_with_no_state_write(pinned, unit):
     """Deliberate divergence: the old path raised inside the agent; the new one
     drops the role, counts it and writes nothing."""
