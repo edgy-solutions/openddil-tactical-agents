@@ -14,7 +14,7 @@ import faust
 import pytest
 
 from algorithm_runtime import runner
-from unit_helpers import WEAR_DIR, wear_decl
+from unit_helpers import ROOT, WEAR_DIR, thermal_decl, wear_decl
 
 # A changelog value as the original engine wrote it (synthetic numbers).
 CHANGELOG_VALUE = (
@@ -161,6 +161,32 @@ def test_refuses_a_directory_whose_declaration_names_another_unit(env, algorithm
         runner.register(new_app())
 
 
+# --- two units side by side -----------------------------------------------------
+def test_wear_and_thermal_register_as_two_agents_on_two_tables_with_equal_partitions(env):
+    env.setenv("ALGORITHMS_DIR", str(ROOT / "algorithms"))
+    env.setenv("ALGORITHMS_ENABLED", "wear,thermal")
+    app = new_app()
+    runner.register(app)
+    assert len(app.agents) == 2
+    assert sorted(app.tables) == ["prognostics_accumulators", "thermal_runaway_state"]
+    assert {t.partitions for t in app.tables.values()} == {wear_decl().state_partitions}
+    assert app.tables["thermal_runaway_state"].changelog_topic.get_topic_name().endswith(
+        "thermal_runaway_state-changelog")
+
+
+def test_thermal_params_arrive_through_the_params_json(env, caplog):
+    env.setenv("ALGORITHMS_DIR", str(ROOT / "algorithms"))
+    env.setenv("ALGORITHMS_ENABLED", "wear,thermal")
+    env.setenv("ALGORITHM_PARAMS_JSON", json.dumps({"thermal": {"delta_threshold_k": 90}}))
+    with caplog.at_level("INFO", logger="algorithm_runtime"):
+        runner.register(new_app())
+    line = next(r.getMessage() for r in caplog.records if "unit=thermal" in r.getMessage())
+    assert "'delta_threshold_k': 90.0" in line
+    env.setenv("ALGORITHM_PARAMS_JSON", json.dumps({"thermal": {"ewma_alpha": 1.5}}))
+    with pytest.raises(ValueError, match="above maximum"):
+        runner.register(new_app())
+
+
 # --- the generated state record -----------------------------------------------
 def test_changelog_value_loads_into_the_generated_class_and_dumps_byte_identical():
     cls = runner.make_record_class(wear_decl())
@@ -169,6 +195,14 @@ def test_changelog_value_loads_into_the_generated_class_and_dumps_byte_identical
     assert (rec.cumulative_distance_m, rec.rounds_fired, rec.last_ecef_y, rec.last_roll_deg) == (
         12345.5, 3, -2.5, None)
     assert rec.dumps() == CHANGELOG_VALUE
+
+
+def test_thermal_record_has_its_own_namespace_and_defaults():
+    decl = thermal_decl()
+    cls = runner.make_record_class(decl)
+    assert cls().dumps() == (
+        b'{"last_temp_k":0.0,"temp_ewma_k":0.0,"__faust":{"ns":"thermal.unit._ThermalRunawayRecord"}}')
+    assert decl.state_record_namespace != wear_decl().state_record_namespace
 
 
 def test_generated_class_fields_follow_the_declaration_in_order():

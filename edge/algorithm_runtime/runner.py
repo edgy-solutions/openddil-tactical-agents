@@ -23,7 +23,7 @@ from pathlib import Path
 import faust
 from openddil.telemetry.v1 import telemetry_pb2 as pb
 
-from algorithm_runtime import core, declaration, loader
+from algorithm_runtime import core, declaration, loader, outputs
 from algorithm_runtime.contract import Unit
 
 log = logging.getLogger("algorithm_runtime")
@@ -81,7 +81,7 @@ def register(app: faust.App) -> None:
     enabled_raw = os.environ.get("ALGORITHMS_ENABLED", "").strip()
     if not enabled_raw:
         raise StartupRefusal(
-            "ALGORITHMS_ENABLED is unset: name the units to run, e.g. ALGORITHMS_ENABLED=wear")
+            "ALGORITHMS_ENABLED is unset: name the units to run, e.g. ALGORITHMS_ENABLED=wear,thermal")
     enabled = [u.strip() for u in enabled_raw.split(",") if u.strip()]
     _refuse_legacy_env()
 
@@ -164,8 +164,11 @@ def _wire(app: faust.App, decl: declaration.Declaration, unit: Unit, params: dic
                 continue
             table[asset_key] = record_cls(**new_state)
             for topic, key, msg in sends:
+                # The topic is whichever the declaration names; the manifest
+                # lists each one a declared unit writes (one note per topic).
                 await out_topics[topic].send(  # produces: derived-sustainment
-                    key=key, value=msg.SerializeToString())
+                    key=key,                   # produces: tactical-events
+                    value=outputs.encode(msg))
 
 
 def _asset_key(raw: bytes) -> str:

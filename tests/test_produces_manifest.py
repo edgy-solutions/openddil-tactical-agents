@@ -31,7 +31,7 @@ ANNOTATION = re.compile(r"#\s*produces:\s*(.+?)\s*$")
 
 EDGE_ENV = {"FAUST_APP_ID": "openddil-edge-tst", "OPENDDIL_EDGE_ID": "edge-tst",
             "OPENDDIL_REGION_ID": "region-tst",
-            "ALGORITHMS_ENABLED": "wear", "ALGORITHMS_DIR": str(ROOT / "algorithms")}
+            "ALGORITHMS_ENABLED": "wear,thermal", "ALGORITHMS_DIR": str(ROOT / "algorithms")}
 REGIONAL_ENV = {"OPENDDIL_REGION_ID": "region-tst",
                 "REGIONAL_EDGES": "edge-tst=redpanda-edge-tst:9092"}
 # Variables the manifests read that the fixture must leave unset so defaults apply.
@@ -150,9 +150,9 @@ def _scan(path, topic_names, factory_kwargs, env):
                 and node.func.attr in SEND):
             continue
         span = lines[node.lineno - 1:node.end_lineno]
-        note = next((m.group(1).strip("\"'") for m in map(ANNOTATION.search, span) if m), None)
-        if note:
-            names.add(pm.expand(note, env))
+        notes = [m.group(1).strip("\"'") for m in map(ANNOTATION.search, span) if m]
+        if notes:  # a dynamic site names every topic it can write, one note per line
+            names |= {pm.expand(n, env) for n in notes}
             continue
         kw = {k.arg: k.value for k in node.keywords}
         got = None

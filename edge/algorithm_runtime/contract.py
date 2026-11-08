@@ -28,6 +28,10 @@ ROLES: dict[str, str] = {
     "pitch_deg": "float",
     "roll_deg": "float",
     "sample_time_ns": "int",
+    # Kelvin, converted through detection.units (pint) from whatever UCUM unit
+    # the source stated; present only when the source set the quantity.
+    "component_temp_k": "float",
+    "ambient_temp_k": "float",
 }
 
 

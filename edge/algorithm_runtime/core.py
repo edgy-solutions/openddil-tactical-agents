@@ -51,9 +51,11 @@ def process_one(unit, decl: Declaration, raw: bytes, state: dict | None):
         counters["no_asset_id"] += 1
         return None, [], counters
 
-    extracted = roles.extract(evt)
+    extracted = roles.extract(evt, {r.role for r in decl.roles})
     if extracted.pop("sample_time_fallback", False):
         counters["sample_time_fallback"] += 1
+    for _role in extracted.pop("role_unconvertible", ()):
+        counters["role_unconvertible"] += 1
     sample = {r.role: extracted[r.role] for r in decl.roles if r.role in extracted}
     missing = [r.role for r in decl.roles if r.required and r.role not in sample]
     if missing:

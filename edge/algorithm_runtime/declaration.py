@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
@@ -28,7 +29,10 @@ API_VERSION = "openddil.io/algorithm/v1"
 RUNTIME = "stream-parallel"
 LABELS = "copy-source"
 # Output kind table. Each kind maps to an envelope field in outputs.py.
-OUTPUT_KINDS = ("sustainment",)
+OUTPUT_KINDS = ("sustainment", "anomaly")
+# An anomaly output names the CloudEvent type it emits and the severity the
+# contract stamps on it; the unit supplies neither.
+EVENT_TYPE = re.compile(r"^openddil\.anomaly\.[a-z0-9_.]+$")
 COMPOSITIONS = ("propagating", "terminal")
 DIRECTIONS = ("local", "upward")
 PARAM_TYPES = ("number", "integer")
@@ -77,6 +81,8 @@ class OutputDecl:
     producer_id: str
     source_protocol: str
     labels: str
+    event_type: str | None = None    # anomaly outputs only
+    severity: str | None = None      # anomaly outputs only
 
 
 @dataclass(frozen=True)
@@ -230,12 +236,26 @@ def validate(raw: Any) -> Declaration:
     if not isinstance(d["outputs"], list) or not d["outputs"]:
         raise DeclarationError("outputs: must be a non-empty list")
     keys = {"kind", "topic", "direction", "producer_id", "source_protocol", "labels"}
+    anomaly_keys = {"event_type", "severity"}
     for i, o in enumerate(d["outputs"]):
         w = f"outputs[{i}]"
-        o = _mapping(o, w, keys, keys)
+        o = _mapping(o, w, keys | anomaly_keys, keys)
         if o["kind"] not in OUTPUT_KINDS:
             raise DeclarationError(
                 f"{w}.kind: {o['kind']!r} is not in the kind table {list(OUTPUT_KINDS)}")
+        event_type = severity = None
+        if o["kind"] == "anomaly":
+            for k in sorted(anomaly_keys):
+                if k not in o:
+                    raise DeclarationError(f"{w}: missing key {k!r}, which an anomaly output needs")
+            event_type = _string(o["event_type"], f"{w}.event_type")
+            if not EVENT_TYPE.match(event_type):
+                raise DeclarationError(
+                    f"{w}.event_type: {event_type!r} must match {EVENT_TYPE.pattern}")
+            severity = _string(o["severity"], f"{w}.severity")
+        else:
+            for k in sorted(anomaly_keys & set(o)):
+                raise DeclarationError(f"{w}.{k}: only an anomaly output carries it")
         if o["direction"] not in DIRECTIONS:
             raise DeclarationError(
                 f"{w}.direction: {o['direction']!r} is not one of {list(DIRECTIONS)}")
@@ -250,6 +270,7 @@ def validate(raw: Any) -> Declaration:
             o["kind"], _string(o["topic"], f"{w}.topic"), o["direction"],
             _string(o["producer_id"], f"{w}.producer_id"),
             _string(o["source_protocol"], f"{w}.source_protocol"), o["labels"],
+            event_type, severity,
         ))
 
     res = _mapping(d["resources"], "resources", {"memory_mi", "cpu_m"}, {"memory_mi", "cpu_m"})

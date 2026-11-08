@@ -28,7 +28,7 @@
             "additionalProperties": false,
             "required": ["role"],
             "properties": {
-              "role": {"enum": ["position_ecef_m", "pitch_deg", "roll_deg", "sample_time_ns"]},
+              "role": {"enum": ["position_ecef_m", "pitch_deg", "roll_deg", "sample_time_ns", "component_temp_k", "ambient_temp_k"]},
               "required": {"type": "boolean"}
             }
           }
@@ -62,13 +62,22 @@
         "additionalProperties": false,
         "required": ["kind", "topic", "direction", "producer_id", "source_protocol", "labels"],
         "properties": {
-          "kind": {"enum": ["sustainment"]},
+          "kind": {"enum": ["sustainment", "anomaly"]},
           "topic": {"type": "string", "minLength": 1},
           "direction": {"enum": ["local", "upward"]},
           "producer_id": {"type": "string", "minLength": 1},
           "source_protocol": {"type": "string", "minLength": 1},
-          "labels": {"const": "copy-source"}
-        }
+          "labels": {"const": "copy-source"},
+          "event_type": {"type": "string", "pattern": "^openddil\\.anomaly\\.[a-z0-9_.]+$"},
+          "severity": {"type": "string", "minLength": 1}
+        },
+        "allOf": [
+          {
+            "if": {"properties": {"kind": {"const": "anomaly"}}, "required": ["kind"]},
+            "then": {"required": ["event_type", "severity"]},
+            "else": {"not": {"anyOf": [{"required": ["event_type"]}, {"required": ["severity"]}]}}
+          }
+        ]
       }
     },
     "resources": {

@@ -15,6 +15,12 @@ Files are named `<topic>.<first>-<last>.gz`. A changelog snapshot is read as a
 whole log: the state is the LAST value per key (JSON-encoded asset id), an
 empty value is a tombstone.
 
+A unit with no `sustainment` output (an anomaly unit, say) has no recorded
+side this harness can align and compare, so it runs in COUNT-ONLY mode: every
+raw record goes through `process_one`, and the report carries the counters and
+the outputs emitted per kind. It says so in its header; "equal" means nothing
+there, because nothing was compared.
+
 Memory stays bounded however long the recording is: raw and recorded records
 are streamed, each asset holds small deques, and the recorded reader advances
 only as far as the replay needs it. Never hold the week in memory.
@@ -218,6 +224,8 @@ def _diff_paths(a, b, path: str = "") -> list[str]:
 # --------------------------------------------------------------------------
 @dataclass
 class Report:
+    mode: str = "compare"                                  # compare | count-only (no recorded-side compare)
+    emitted: dict = field(default_factory=dict)            # count-only: output kind -> messages emitted
     topics: dict = field(default_factory=dict)             # topic -> record count
     snapshot_assets: int = 0
     aligned: int = 0
@@ -646,10 +654,41 @@ class _Oracle:
 # --------------------------------------------------------------------------
 # API
 # --------------------------------------------------------------------------
+def _count_only(unit, decl, raw_records) -> Report:
+    """Feed every raw record through `process_one`, a fresh state per asset,
+    and report counters and emitted outputs per kind. No recorded side."""
+    r = Report(mode="count-only")
+    states: dict[str, dict] = {}
+    counters: Counter = Counter()
+    emitted: Counter = Counter()
+    n = 0
+    for _offset, _ts, _key, value in raw_records:
+        n += 1
+        try:
+            evt = pb.EntityTelemetryEvent()
+            evt.ParseFromString(value)
+            asset_id = evt.asset.asset_id
+        except Exception:  # noqa: BLE001 - counted by process_one
+            asset_id = ""
+        new_state, sends, c = core.process_one(unit, decl, value, states.get(asset_id) if asset_id else None)
+        counters.update(c)
+        if new_state is not None:
+            states[asset_id] = new_state
+        for _topic, _key, msg in sends:
+            emitted["anomaly" if isinstance(msg, dict) else "sustainment"] += 1
+    r.topics = {decl.input_topic: n}
+    r.core_counters = dict(counters)
+    r.emitted = dict(emitted)
+    r.end_state = {"assets": len(states)}
+    return r
+
+
 def replay(unit, decl, params, raw_records, snapshot, recorded_outputs, env,
            end_snapshot=None, overlap: int = _OVERLAP, oracle: bool = False) -> Report:
     """Replay `raw_records` through `unit` from `snapshot` and compare with
-    `recorded_outputs` (both iterators of (offset, ts_ms, key, value)).
+    `recorded_outputs` (both iterators of (offset, ts_ms, key, value)). A unit
+    with no sustainment output is replayed count-only instead (see the module
+    docstring); `snapshot` and `recorded_outputs` are then unused.
     `env` supplies OPENDDIL_EDGE_ID (the stamped tier) and OPENDDIL_REGION_ID."""
     tier = env.get("OPENDDIL_EDGE_ID", "")
     if not tier:
@@ -661,6 +700,8 @@ def replay(unit, decl, params, raw_records, snapshot, recorded_outputs, env,
                 os.environ[k] = env[k]
             else:
                 os.environ.pop(k, None)
+        if not any(o.kind == "sustainment" for o in decl.outputs):
+            return _count_only(unit, decl, raw_records)
         return _Replay(unit, decl, params, raw_records, snapshot, recorded_outputs, end_snapshot,
                        tier, overlap, oracle).run()
     finally:
@@ -687,6 +728,16 @@ def _expand(pattern: str, what: str) -> list[str]:
 
 
 def _summary(r: Report, out: str) -> list[str]:
+    if r.mode == "count-only":
+        return [
+            "mode: COUNT-ONLY, no recorded-side compare: every raw record was fed through the unit; "
+            "nothing was compared with what production emitted",
+            f"records: {', '.join(f'{t}={n}' for t, n in r.topics.items())}",
+            "emitted: " + (", ".join(f"{k}={n}" for k, n in sorted(r.emitted.items())) or "none"),
+            "counters: " + (" ".join(f"{k}={n}" for k, n in sorted(r.core_counters.items())) or "none"),
+            f"assets seen: {(r.end_state or {}).get('assets', 0)}",
+            f"report: {out}",
+        ]
     es = r.end_state or {}
     lines = [
         f"records: {', '.join(f'{t}={n}' for t, n in r.topics.items())}",
@@ -713,8 +764,8 @@ def main(argv=None) -> int:
     ap.add_argument("--edge-id", required=True)
     ap.add_argument("--region-id", required=True)
     ap.add_argument("--raw", required=True, help="glob of recorded raw input files")
-    ap.add_argument("--recorded", required=True, help="glob of recorded output files")
-    ap.add_argument("--snapshot", required=True, help="glob of the changelog snapshot the replay starts from")
+    ap.add_argument("--recorded", help="glob of recorded output files (not read in count-only mode)")
+    ap.add_argument("--snapshot", help="glob of the changelog snapshot the replay starts from (not read in count-only mode)")
     ap.add_argument("--end-snapshot", help="glob of a later changelog snapshot to compare the final state with")
     ap.add_argument("--out", required=True)
     ap.add_argument("--overlap", type=int, default=_OVERLAP,
@@ -733,10 +784,18 @@ def main(argv=None) -> int:
         params = declaration.resolve_params(decl, overrides)
         unit = load_unit(unit_dir, decl, params)
         raw = _expand(args.raw, "raw")
-        recorded = _expand(args.recorded, "recorded")
-        snapshot = load_snapshot(_expand(args.snapshot, "snapshot"), decl)
-        end = load_snapshot(_expand(args.end_snapshot, "end-snapshot"), decl) if args.end_snapshot else None
-        report = replay(unit, decl, params, read_records(raw), snapshot, read_records(recorded),
+        count_only = not any(o.kind == "sustainment" for o in decl.outputs)
+        if count_only:
+            snapshot, recorded, end = {}, [], None
+        else:
+            for name in ("recorded", "snapshot"):
+                if not getattr(args, name):
+                    raise ReplayInputError(f"--{name} is required for {decl.unit}")
+            recorded = _expand(args.recorded, "recorded")
+            snapshot = load_snapshot(_expand(args.snapshot, "snapshot"), decl)
+            end = load_snapshot(_expand(args.end_snapshot, "end-snapshot"), decl) if args.end_snapshot else None
+        report = replay(unit, decl, params, read_records(raw), snapshot,
+                        iter(()) if count_only else read_records(recorded),
                         {"OPENDDIL_EDGE_ID": args.edge_id, "OPENDDIL_REGION_ID": args.region_id},
                         end_snapshot=end, overlap=args.overlap, oracle=args.oracle)
     except (ReplayInputError, declaration.DeclarationError, guard.GuardError, OSError) as exc:
@@ -744,6 +803,8 @@ def main(argv=None) -> int:
         return 2
     Path(args.out).write_text(report.to_json(), encoding="utf-8")
     print("\n".join(_summary(report, args.out)))
+    if report.mode == "count-only":
+        return 0 if report.topics.get(decl.input_topic) else 1
     bad = report.different or report.stamp_failures or (report.end_state or {}).get("different")
     return 0 if report.compared > 0 and not bad else 1
 
