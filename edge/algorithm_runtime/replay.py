@@ -841,6 +841,7 @@ def compare_oracle(unit, decl, params, raw_records, env, name: str, synth_seed: 
         oracle = pkg.Oracle(params, tier, env.get("OPENDDIL_REGION_ID", ""))
         normalize = getattr(pkg, "normalize", lambda _kind, m: m)
         fill = None
+        envelope_in = decl.input_format == "json-envelope"
         if synth_seed is not None:
             import importlib
             try:
@@ -883,7 +884,18 @@ def compare_oracle(unit, decl, params, raw_records, env, name: str, synth_seed: 
         for _offset, ts_ms, _key, value in raw_records:
             n += 1
             asset_id = ""
-            if fill is not None:
+            if envelope_in:
+                # A json-envelope unit: the recording supplies timing and the
+                # asset, the synth the envelope body (the recording holds none).
+                if fill is not None:
+                    evt = pb.EntityTelemetryEvent()
+                    try:
+                        evt.ParseFromString(value)
+                    except Exception:  # noqa: BLE001 - not a telemetry record: no pair
+                        continue
+                    value = fill(ts_ms, evt.asset.asset_id)
+                asset_id = core.envelope_asset(value)
+            elif fill is not None:
                 evt = pb.EntityTelemetryEvent()
                 try:
                     evt.ParseFromString(value)
@@ -893,12 +905,13 @@ def compare_oracle(unit, decl, params, raw_records, env, name: str, synth_seed: 
                     fill(evt)
                     value = evt.SerializeToString()
             rt_ns = ts_ms * 1_000_000
-            try:
-                probe = pb.EntityTelemetryEvent()
-                probe.ParseFromString(value)
-                asset_id = probe.asset.asset_id
-            except Exception:  # noqa: BLE001 - counted by process_one
-                asset_id = ""
+            if not envelope_in:
+                try:
+                    probe = pb.EntityTelemetryEvent()
+                    probe.ParseFromString(value)
+                    asset_id = probe.asset.asset_id
+                except Exception:  # noqa: BLE001 - counted by process_one
+                    asset_id = ""
             t0 = _time.perf_counter()
             old_out = oracle.feed(value, rt_ns)
             t1 = _time.perf_counter()
@@ -1043,6 +1056,8 @@ def main(argv=None) -> int:
         raw = _expand(args.raw, "raw")
         if args.synth_seed is not None and not args.compare_oracle:
             raise ReplayInputError("--synth-seed needs --compare-oracle")
+        if args.compare_oracle and decl.input_format == "json-envelope" and args.synth_seed is None:
+            raise ReplayInputError("a json-envelope unit's recording holds no envelopes: --synth-seed is required")
         if args.compare_oracle:
             timing: dict = {}
             orep = compare_oracle(

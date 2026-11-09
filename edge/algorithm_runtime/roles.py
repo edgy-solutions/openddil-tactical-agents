@@ -53,6 +53,30 @@ def posture_inputs(evt: pb.EntityTelemetryEvent):
     return deploy_signal, speed, now
 
 
+def extract_envelope(env: dict, wanted=None) -> dict:
+    """Role primitives of a gated element envelope (a decoded JSON object)."""
+    out: dict = {}
+    if wanted is None or "observed_at_s" in wanted:
+        obs_ns = env.get("observed_at_ns")
+        if _is_json_number(obs_ns):
+            out["observed_at_s"] = obs_ns / 1e9
+    if wanted is None or "elements" in wanted:
+        found = []
+        for el in env.get("elements") or ():
+            if not isinstance(el, dict):
+                continue
+            path = el.get("element_id")
+            if not path or not isinstance(path, str):
+                continue
+            found.append((path, el.get("layer_name") or "", dict(el)))
+        out["elements"] = tuple(found)
+    return out
+
+
+def _is_json_number(v) -> bool:
+    return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+
 def _quantity(q):
     """(magnitude, str(pint units)) for a proto Quantity, or None when it is
     unset (zero with no unit) or its unit is one pint cannot read: the test the

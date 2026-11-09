@@ -53,6 +53,14 @@ ROLES: dict[str, str] = {
     "deploy_signal": "bool | None",
     "speed_mps": "float | None",
     "sample_time_s": "float",
+    # Roles of a `json-envelope` input (the element snapshot), from the
+    # envelope the host already gated. `observed_at_s` is observed_at_ns / 1e9,
+    # present only when that is numeric and not a bool. `elements` is a tuple of
+    # (element_id, layer_name or "", {field: raw value}) in envelope order, with
+    # non-dict elements and empty or non-str ids left out; the values are not
+    # filtered, so the unit applies its own numeric rule.
+    "observed_at_s": "float",
+    "elements": "tuple[tuple[str, str, dict], ...]",
 }
 
 

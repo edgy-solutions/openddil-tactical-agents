@@ -30,7 +30,7 @@ API_VERSION = "openddil.io/algorithm/v1"
 RUNTIME = "stream-parallel"
 LABELS = "copy-source"
 # Output kind table. Each kind maps to an envelope field in outputs.py.
-OUTPUT_KINDS = ("sustainment", "anomaly", "window", "latest_state", "posture_transition")
+OUTPUT_KINDS = ("sustainment", "anomaly", "window", "latest_state", "posture_transition", "band_crossing")
 # Output class. A `value` output is whatever the unit returns; a `transition`
 # output is one record per change of the named state field, and the host
 # drops the payload of a step in which that field did not change.
@@ -38,13 +38,20 @@ OUTPUT_CLASSES = ("value", "transition")
 # Producer stamp. `none` is for the kinds whose bytes or shape must stay what
 # they were before the unit existed (so they carry no producer fields either).
 STAMPS = ("producer", "none")
-UNSTAMPED_KINDS = ("latest_state", "posture_transition")
+UNSTAMPED_KINDS = ("latest_state", "posture_transition", "band_crossing")
 # An anomaly output names the CloudEvent type it emits and the severity the
 # contract stamps on it; the unit supplies neither.
 EVENT_TYPE = re.compile(r"^openddil\.anomaly\.[a-z0-9_.]+$")
 COMPOSITIONS = ("propagating", "terminal")
 DIRECTIONS = ("local", "upward")
 PARAM_TYPES = ("number", "integer")
+# A `bands` param is a whole mapping, field -> {limits, names, hysteresis,
+# severity} (the element health bands); it has no minimum or maximum.
+DECLARED_PARAM_TYPES = PARAM_TYPES + ("bands",)
+# Input format. `protobuf` is an EntityTelemetryEvent; `json-envelope` is the
+# element snapshot's JSON envelope, whose gates the host applies before the step.
+INPUT_FORMATS = ("protobuf", "json-envelope")
+JSON_ENVELOPE_ROLES = ("observed_at_s", "elements")
 # State persistence. `durable` is a Faust Table (RocksDB, changelog-replicated);
 # `memory` is a per-process dict, lost on a restart, for state a unit may
 # rebuild from the live feed. Only memory state may hold an `object` field.
@@ -70,7 +77,7 @@ class DeclarationError(ValueError):
 class Param:
     name: str
     type: str
-    default: int | float
+    default: int | float | dict
     minimum: float | None = None
     maximum: float | None = None
     unit: str | None = None
@@ -104,6 +111,7 @@ class OutputDecl:
     output_class: str = "value"      # YAML key `class`
     on_change_of: str | None = None  # transition outputs only: a declared state field
     stamp: str = "producer"
+    many: bool = False               # the step returns a list of payloads for this kind
 
 
 @dataclass(frozen=True)
@@ -124,6 +132,7 @@ class Declaration:
     memory_mi: float
     cpu_m: float
     state_persistence: str = "durable"
+    input_format: str = "protobuf"
 
     def param(self, name: str) -> Param | None:
         return next((p for p in self.params if p.name == name), None)
@@ -146,6 +155,44 @@ def _coerce(value: Any, typ: str, where: str) -> int | float:
             raise DeclarationError(f"{where}: {value!r} is not an integer")
         return int(value)
     return value
+
+
+def parse_bands(cfg: Any) -> dict:
+    """Validate a band mapping (field -> spec); ValueError on any bad shape.
+    These are the rules and messages of the old `element_bands.parse_config`."""
+    if not isinstance(cfg, dict) or not cfg:
+        raise ValueError("band config must be a non-empty object of field -> spec")
+    for field, spec in cfg.items():
+        if not isinstance(spec, dict):
+            raise ValueError(f"{field}: spec must be an object")
+        limits = spec.get("limits")
+        names = spec.get("names")
+        hyst = spec.get("hysteresis")
+        sev = spec.get("severity")
+        if not isinstance(limits, list) or not limits or not all(_is_num(x) for x in limits):
+            raise ValueError(f"{field}: limits must be a non-empty list of numbers")
+        if any(b <= a for a, b in zip(limits, limits[1:])):
+            raise ValueError(f"{field}: limits must be strictly ascending")
+        if (not isinstance(names, list) or len(names) != len(limits) + 1
+                or not all(isinstance(n, str) and n for n in names)
+                or len(set(names)) != len(names)):
+            raise ValueError(
+                f"{field}: names must be {len(limits) + 1} distinct non-empty strings")
+        if not _is_num(hyst) or hyst < 0:
+            raise ValueError(f"{field}: hysteresis must be a number >= 0")
+        if not isinstance(sev, dict):
+            raise ValueError(f"{field}: severity must be an object of band -> string")
+        for n in names:
+            if not isinstance(sev.get(n), str) or not sev[n]:
+                raise ValueError(f"{field}: band {n!r} has no severity")
+    return copy.deepcopy(cfg)
+
+
+def _bands(value: Any, where: str) -> dict:
+    try:
+        return parse_bands(value)
+    except ValueError as exc:
+        raise DeclarationError(f"{where}: {exc}") from None
 
 
 def _mapping(v: Any, where: str, allowed: set[str], required: set[str]) -> Mapping:
@@ -192,8 +239,11 @@ def validate(raw: Any) -> Declaration:
         raise DeclarationError(
             "dependencies: must be empty; dependencies ship in the image, never fetched")
 
-    inp = _mapping(d["inputs"], "inputs", {"topic", "roles"}, {"topic", "roles"})
+    inp = _mapping(d["inputs"], "inputs", {"topic", "roles", "format"}, {"topic", "roles"})
     input_topic = _string(inp["topic"], "inputs.topic")
+    input_format = inp.get("format", "protobuf")
+    if input_format not in INPUT_FORMATS:
+        raise DeclarationError(f"inputs.format: {input_format!r} is not one of {list(INPUT_FORMATS)}")
     if not isinstance(inp["roles"], list) or not inp["roles"]:
         raise DeclarationError("inputs.roles: must be a non-empty list")
     roles = []
@@ -205,6 +255,11 @@ def validate(raw: Any) -> Declaration:
         req = r.get("required", False)
         if not isinstance(req, bool):
             raise DeclarationError(f"inputs.roles[{i}].required: must be a boolean")
+        if (r["role"] in JSON_ENVELOPE_ROLES) != (input_format == "json-envelope"):
+            raise DeclarationError(
+                f"inputs.roles[{i}].role: {r['role']!r} is "
+                + ("not a role of a json-envelope input" if input_format == "json-envelope"
+                   else "a role of a json-envelope input only"))
         roles.append(InputRole(r["role"], req))
 
     params = []
@@ -212,9 +267,13 @@ def validate(raw: Any) -> Declaration:
         raise DeclarationError("params: must be a mapping")
     for name, p in d["params"].items():
         w = f"params.{name}"
+        if isinstance(p, dict) and p.get("type") == "bands":
+            p = _mapping(p, w, {"type", "default"}, {"type", "default"})
+            params.append(Param(name, "bands", _bands(p["default"], f"{w}.default")))
+            continue
         p = _mapping(p, w, {"type", "default", "minimum", "maximum", "unit"}, {"type", "default"})
-        if p["type"] not in PARAM_TYPES:
-            raise DeclarationError(f"{w}.type: {p['type']!r} is not one of {list(PARAM_TYPES)}")
+        if p["type"] not in DECLARED_PARAM_TYPES:
+            raise DeclarationError(f"{w}.type: {p['type']!r} is not one of {list(DECLARED_PARAM_TYPES)}")
         default = _coerce(p["default"], p["type"], f"{w}.default")
         lo, hi = p.get("minimum"), p.get("maximum")
         for bound, label in ((lo, "minimum"), (hi, "maximum")):
@@ -295,7 +354,7 @@ def validate(raw: Any) -> Declaration:
         raise DeclarationError("outputs: must be a non-empty list")
     keys = {"kind", "topic", "direction", "labels"}
     producer_keys = {"producer_id", "source_protocol"}
-    class_keys = {"class", "on_change_of", "stamp"}
+    class_keys = {"class", "on_change_of", "stamp", "many"}
     anomaly_keys = {"event_type", "severity"}
     state_names = {f.name for f in fields}
     for i, o in enumerate(d["outputs"]):
@@ -315,6 +374,9 @@ def validate(raw: Any) -> Declaration:
                 raise DeclarationError(f"{w}.{k}: an output with stamp: none carries no producer fields")
             if stamp != "none" and k not in o:
                 raise DeclarationError(f"{w}: missing key {k!r}")
+        many = o.get("many", False)
+        if not isinstance(many, bool):
+            raise DeclarationError(f"{w}.many: must be a boolean")
         klass = o.get("class", "value")
         if klass not in OUTPUT_CLASSES:
             raise DeclarationError(f"{w}.class: {klass!r} is not one of {list(OUTPUT_CLASSES)}")
@@ -354,7 +416,7 @@ def validate(raw: Any) -> Declaration:
             o["kind"], _string(o["topic"], f"{w}.topic"), o["direction"],
             _string(o["producer_id"], f"{w}.producer_id") if stamp != "none" else "",
             _string(o["source_protocol"], f"{w}.source_protocol") if stamp != "none" else "",
-            o["labels"], event_type, severity, klass, on_change, stamp,
+            o["labels"], event_type, severity, klass, on_change, stamp, many,
         ))
 
     res = _mapping(d["resources"], "resources", {"memory_mi", "cpu_m"}, {"memory_mi", "cpu_m"})
@@ -368,6 +430,7 @@ def validate(raw: Any) -> Declaration:
         params=tuple(params), state_table=table, state_partitions=parts,
         state_record_namespace=ns, state_fields=tuple(fields), outputs=tuple(outs),
         memory_mi=res["memory_mi"], cpu_m=res["cpu_m"], state_persistence=persistence,
+        input_format=input_format,
     )
 
 
@@ -383,7 +446,7 @@ def load(path: str | Path) -> Declaration:
         raise DeclarationError(f"{path}: {exc}") from None
 
 
-def resolve_params(decl: Declaration, overrides: Mapping[str, Any] | None) -> dict[str, int | float]:
+def resolve_params(decl: Declaration, overrides: Mapping[str, Any] | None) -> dict[str, Any]:
     """Declaration defaults with the deployment's overrides applied, typed
     and bounds-checked. An override naming a param the declaration lacks is
     refused (a typo would otherwise run on defaults without a sign)."""
@@ -391,11 +454,14 @@ def resolve_params(decl: Declaration, overrides: Mapping[str, Any] | None) -> di
     for k in overrides:
         if decl.param(k) is None:
             raise DeclarationError(f"params override {k!r}: {decl.unit} declares no such param")
-    out: dict[str, int | float] = {}
+    out: dict[str, Any] = {}
     for p in decl.params:
-        v = p.default
+        v = copy.deepcopy(p.default)
         if p.name in overrides:
             w = f"params override {p.name!r}"
+            if p.type == "bands":
+                out[p.name] = _bands(overrides[p.name], w)
+                continue
             v = _coerce(overrides[p.name], p.type, w)
             if p.minimum is not None and v < p.minimum:
                 raise DeclarationError(f"{w}: {v!r} is below minimum {p.minimum!r}")

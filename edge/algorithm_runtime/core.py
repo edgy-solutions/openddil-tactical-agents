@@ -8,6 +8,7 @@ an output never loses the accumulated state.
 from __future__ import annotations
 
 import copy
+import json
 import logging
 import os
 from collections import Counter
@@ -19,6 +20,54 @@ from algorithm_runtime import outputs, roles
 from algorithm_runtime.declaration import Declaration, config_hash
 
 log = logging.getLogger("algorithm_runtime")
+
+
+_UNSET = object()
+
+
+def parse_envelope(raw: bytes) -> dict | None:
+    """The decoded element envelope, or None when `raw` is not JSON or not a
+    JSON object."""
+    try:
+        env = json.loads(raw)
+    except Exception:  # noqa: BLE001 - skip-not-crash, as the old element agent
+        return None
+    return env if isinstance(env, dict) else None
+
+
+def envelope_asset(raw: bytes) -> str:
+    """asset_id of a json-envelope message, or "" when it has none (a str,
+    non-empty), the gate the old element agent applied."""
+    env = parse_envelope(raw)
+    aid = env.get("asset_id") if env is not None else None
+    return aid if isinstance(aid, str) and aid else ""
+
+
+def _read_envelope(raw: bytes, parsed, counters: Counter):
+    """The json-envelope input's gates, in the old agent's order: parse (an
+    object), a str asset_id, and a rollup the envelope produces. A rollup that
+    raises is a skip of its own (the old agent had no handler and stopped).
+    Returns (env, extracted roles) or None for a skip."""
+    env = parse_envelope(raw) if parsed is _UNSET else parsed
+    if env is None:
+        log.warning("element envelope is not a JSON object; skipped")
+        counters["envelope_unreadable"] += 1
+        return None
+    aid = env.get("asset_id")
+    if not aid or not isinstance(aid, str):
+        counters["no_asset_id"] += 1
+        return None
+    from element_rollup import rollup_from_envelope  # host side, shared with the element window path
+    try:
+        rollup = rollup_from_envelope(env)
+    except Exception as exc:  # noqa: BLE001 - a malformed envelope skips, never the stream
+        log.warning("element envelope for %s: rollup raised %r; skipped", aid, exc)
+        counters["rollup_raised"] += 1
+        return None
+    if rollup is None:
+        counters["no_rollup"] += 1
+        return None
+    return env
 
 
 def default_state(decl: Declaration) -> dict:
@@ -38,7 +87,8 @@ def _stamp_hash(unit, decl: Declaration) -> str:
 def process_one(unit, decl: Declaration, raw: bytes, state: dict | None,
                 record_time_ns: int | None = None, *,
                 window_rollup: Callable[[str], object] | None = None,
-                on_payload: Callable[[str, str, object], None] | None = None):
+                on_payload: Callable[[str, str, object], None] | None = None,
+                parsed=_UNSET):
     """Returns (new_state or None, [(topic, key_bytes, message)], counters).
 
     A None state means "write nothing": the sample was skipped (unparseable,
@@ -59,24 +109,33 @@ def process_one(unit, decl: Declaration, raw: bytes, state: dict | None,
     old in-line agent had no handler at all, so a raise there lost the sample
     and kept the same partial state)."""
     counters: Counter = Counter()
-    try:
-        evt = pb.EntityTelemetryEvent()
-        evt.ParseFromString(raw)
-    except Exception as exc:  # noqa: BLE001 - parse errors are skip-not-crash
-        log.warning("%s: failed to parse EntityTelemetryEvent: %s", decl.unit, exc)
-        counters["parse_failed"] += 1
-        return None, [], counters
+    if decl.input_format == "json-envelope":
+        # `parsed` (a decoded envelope, or None for an unreadable one) lets the
+        # caller that already parsed it for the asset key spare a second parse.
+        evt = _read_envelope(raw, parsed, counters)
+        if evt is None:
+            return None, [], counters
+        asset_id = evt["asset_id"]
+        extracted = roles.extract_envelope(evt, {r.role for r in decl.roles})
+    else:
+        try:
+            evt = pb.EntityTelemetryEvent()
+            evt.ParseFromString(raw)
+        except Exception as exc:  # noqa: BLE001 - parse errors are skip-not-crash
+            log.warning("%s: failed to parse EntityTelemetryEvent: %s", decl.unit, exc)
+            counters["parse_failed"] += 1
+            return None, [], counters
 
-    asset_id = evt.asset.asset_id
-    if not asset_id:
-        counters["no_asset_id"] += 1
-        return None, [], counters
+        asset_id = evt.asset.asset_id
+        if not asset_id:
+            counters["no_asset_id"] += 1
+            return None, [], counters
 
-    extracted = roles.extract(evt, {r.role for r in decl.roles})
-    if extracted.pop("sample_time_fallback", False):
-        counters["sample_time_fallback"] += 1
-    for _role in extracted.pop("role_unconvertible", ()):
-        counters["role_unconvertible"] += 1
+        extracted = roles.extract(evt, {r.role for r in decl.roles})
+        if extracted.pop("sample_time_fallback", False):
+            counters["sample_time_fallback"] += 1
+        for _role in extracted.pop("role_unconvertible", ()):
+            counters["role_unconvertible"] += 1
     if record_time_ns is not None:
         extracted["record_time_ns"] = record_time_ns
     sample = {r.role: extracted[r.role] for r in decl.roles if r.role in extracted}
@@ -118,23 +177,34 @@ def process_one(unit, decl: Declaration, raw: bytes, state: dict | None,
         if out is not None and out.output_class == "transition" and work[out.on_change_of] == watched[out.on_change_of]:
             counters["transition_suppressed"] += 1
             continue
-        try:
-            if out is None:
-                raise outputs.OutputError(f"{decl.unit} returned undeclared output kind {kind!r}")
-            msg = outputs.build_payload(kind, payload)
-            extra = {}
-            if kind == "window" and window_rollup is not None:
-                extra["rollup"] = window_rollup(asset_id)
-            evt_out = outputs.build_event(
-                evt, msg, out, unit=decl.unit, version=decl.version,
-                config_hash=stamp, tier=tier, raw=raw, **extra,
-            )
-            if on_payload is not None:
-                on_payload(asset_id, kind, payload)
-        except outputs.OutputError as exc:
-            log.warning("%s: output refused for asset %s: %s", decl.unit, asset_id, exc)
-            counters["output_refused"] += 1
-            continue
-        # An unstamped output keeps its old send's str key.
-        sends.append((out.topic, asset_id if out.stamp == "none" else asset_id.encode(), evt_out))
+        if out is not None and out.many:
+            # A list of payloads, sent in order; an empty list sends nothing.
+            if not isinstance(payload, (list, tuple)):
+                log.warning("%s: output refused for asset %s: %r is a many output and needs a list",
+                            decl.unit, asset_id, kind)
+                counters["output_refused"] += 1
+                continue
+            payloads = list(payload)
+        else:
+            payloads = [payload]
+        for payload in payloads:
+            try:
+                if out is None:
+                    raise outputs.OutputError(f"{decl.unit} returned undeclared output kind {kind!r}")
+                msg = outputs.build_payload(kind, payload)
+                extra = {}
+                if kind == "window" and window_rollup is not None:
+                    extra["rollup"] = window_rollup(asset_id)
+                evt_out = outputs.build_event(
+                    evt, msg, out, unit=decl.unit, version=decl.version,
+                    config_hash=stamp, tier=tier, raw=raw, params=unit.params, **extra,
+                )
+                if on_payload is not None:
+                    on_payload(asset_id, kind, payload)
+            except outputs.OutputError as exc:
+                log.warning("%s: output refused for asset %s: %s", decl.unit, asset_id, exc)
+                counters["output_refused"] += 1
+                continue
+            # An unstamped output keeps its old send's str key.
+            sends.append((out.topic, asset_id if out.stamp == "none" else asset_id.encode(), evt_out))
     return work, sends, counters

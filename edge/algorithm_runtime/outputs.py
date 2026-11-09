@@ -42,6 +42,7 @@ from openddil.logistics.v1 import windowed_telemetry_pb2 as winpb
 from openddil.telemetry.v1 import telemetry_pb2 as pb
 
 from algorithm_runtime.declaration import OutputDecl
+from element_band_event import build_band_event
 from posture_event import build_transition_event
 
 
@@ -89,6 +90,23 @@ def _transition_payload(payload: Mapping) -> dict:
         raise OutputError("posture_transition payload must carry exactly prev, new, deploy_signal and speed")
     return {"prev": _posture_dict(payload["prev"], "prev"), "new": _posture_dict(payload["new"], "new"),
             "deploy_signal": payload["deploy_signal"], "speed": payload["speed"]}
+
+
+_BAND_KEYS = {"element_id", "layer_name", "field", "from", "to", "value"}
+
+
+def _band_payload(payload: Mapping) -> dict:
+    """One crossing, as the unit states it. Severity, time and labels are the
+    host's, so a payload carrying any of them is refused."""
+    if not isinstance(payload, Mapping) or set(payload) != _BAND_KEYS:
+        raise OutputError(
+            "band_crossing payload must carry exactly element_id, layer_name, field, from, to and value "
+            "(severity, time and labels are the host's)")
+    if not all(isinstance(payload[k], str) for k in ("element_id", "field", "from", "to")):
+        raise OutputError("band_crossing element_id, field, from and to must be strings")
+    if not _is_number(payload["value"]):
+        raise OutputError("band_crossing value must be a number")
+    return dict(payload)
 
 
 def _is_number(v) -> bool:
@@ -175,6 +193,8 @@ def build_payload(kind: str, payload: Mapping) -> pb.SustainmentMetrics | winpb.
         return _latest_state_payload(payload)
     if kind == "posture_transition":
         return _transition_payload(payload)
+    if kind == "band_crossing":
+        return _band_payload(payload)
     if kind != "sustainment":
         raise OutputError(f"unknown output kind {kind!r}")
     if "value_provenance" in payload:
@@ -214,6 +234,7 @@ def build_event(
     tier: str,
     rollup: winpb.ElementRollup | None = None,
     raw: bytes | None = None,
+    params: Mapping | None = None,
 ) -> pb.EntityTelemetryEvent | winpb.WindowedTelemetry | dict | bytes:
     """Build the output envelope. A sustainment output is a fresh EntityTelemetryEvent carrying only
     the derived sustainment + identity + provenance. No kinematics are
@@ -223,6 +244,8 @@ def build_event(
         return _latest_state_event(src, sustainment, raw)
     if out.kind == "posture_transition":
         return _transition_event(src, sustainment, tier)
+    if out.kind == "band_crossing":
+        return _band_event(src, sustainment, params or {}, tier)
     if out.kind == "anomaly":
         return _anomaly_event(src, sustainment, out, unit=unit, version=version,
                               config_hash=config_hash, tier=tier)
@@ -308,6 +331,33 @@ def _latest_state_event(src: pb.EntityTelemetryEvent, payload: dict, raw: bytes 
         src.operational_state.posture_since.FromNanoseconds(int(round(payload["posture_since"] * 1e9)))
     src.operational_state.posture_status = _POSTURE_TO_PROTO[payload["posture"]]
     return src.SerializeToString()
+
+
+def _band_event(env: dict, payload: dict, params: Mapping, tier: str) -> dict:
+    """The element band CloudEvent, unchanged (no producer stamp). The host
+    states what the unit may not: severity from the declared bands, the time
+    from the envelope's observed_at_ns, and the labels from the envelope under
+    the old type checks (a non-str nation is none, releasable_to keeps only
+    its str members and is none unless a list)."""
+    spec = (params.get("bands") or {}).get(payload["field"])
+    if spec is None:
+        raise OutputError(f"band_crossing field {payload['field']!r} is not in the declared bands")
+    severity = spec["severity"].get(payload["to"])
+    if severity is None:
+        raise OutputError(f"band_crossing band {payload['to']!r} has no severity for {payload['field']!r}")
+    nation = env.get("originator_nation") or ""
+    releasable = env.get("releasable_to") or []
+    if not isinstance(releasable, list):
+        releasable = []
+    releasable = [r for r in releasable if isinstance(r, str)]
+    try:
+        return build_band_event(
+            env["asset_id"], payload["element_id"], payload["layer_name"], payload["field"],
+            payload["from"], payload["to"], float(payload["value"]), env["observed_at_ns"] / 1e9,
+            severity, nation if isinstance(nation, str) else "", releasable,
+            tier, os.getenv("OPENDDIL_REGION_ID", "region-01"))
+    except (ValueError, KeyError, OverflowError) as exc:
+        raise OutputError(f"band crossing refused: {exc!r}") from exc
 
 
 def _transition_event(src: pb.EntityTelemetryEvent, payload: dict, tier: str) -> dict:

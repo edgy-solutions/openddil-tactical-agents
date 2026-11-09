@@ -45,6 +45,7 @@ _LEGACY_UNIT_ENV = {
     "POSTURE_MOVE_SPEED_MPS": ("posture", "move_speed_mps"),
     "POSTURE_MOVE_HOLD_S": ("posture", "move_hold_s"),
     "POSTURE_STOP_HOLD_S": ("posture", "stop_hold_s"),
+    "ELEMENT_BANDS_JSON": ("element_bands", "bands"),
 }
 
 
@@ -122,7 +123,15 @@ class Wiring:
         (None for none); a memory unit's is looked up here and kept here."""
         memory = self.decl.state_persistence == "memory"
         mixed = not memory and bool(self.field_names)
-        asset = _asset_key(raw) if memory or mixed else ""
+        extra = {}
+        if self.decl.input_format == "json-envelope":
+            # Parse the envelope once: the asset key and the gates share it.
+            env = core.parse_envelope(raw)
+            aid = env.get("asset_id") if env is not None else None
+            asset = aid if isinstance(aid, str) else ""
+            extra["parsed"] = env
+        else:
+            asset = _asset_key(raw) if memory or mixed else ""
         if memory:
             state = self.memory.get(asset) if asset else None
         elif mixed and state is not None and asset:
@@ -133,7 +142,7 @@ class Wiring:
             state = {**state, **held}
         new_state, sends, new_counters = core.process_one(
             self.unit, self.decl, raw, state, record_time_ns,
-            window_rollup=self.window_rollup, on_payload=self._remember)
+            window_rollup=self.window_rollup, on_payload=self._remember, **extra)
         _count(self.counters, new_counters)
         if memory and new_state is not None:
             self.memory[asset] = new_state

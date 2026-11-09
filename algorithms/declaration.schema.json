@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://openddil.io/algorithm/v1/declaration.schema.json",
   "title": "Algorithm unit declaration, openddil.io/algorithm/v1",
-  "description": "Mirrors edge/algorithm_runtime/declaration.py. Two rules are not expressible here, and the runtime validator enforces them: a param default must lie within its own minimum/maximum, and a transition output's on_change_of must name a declared state field. An object or boolean state field is allowed only under persistence: memory (the unit's or its own); a durable unit needs at least one durable field; a memory unit has no table, partitions or record_namespace.",
+  "description": "Mirrors edge/algorithm_runtime/declaration.py. Two rules are not expressible here, and the runtime validator enforces them: a param default must lie within its own minimum/maximum, a bands default's limits must ascend with one more distinct name than limits and a severity for each name (the validator checks them), and a transition output's on_change_of must name a declared state field. An object or boolean state field is allowed only under persistence: memory (the unit's or its own); a durable unit needs at least one durable field; a memory unit has no table, partitions or record_namespace.",
   "type": "object",
   "additionalProperties": false,
   "required": ["apiVersion", "unit", "version", "runtime", "entrypoint", "key", "composition", "inputs", "params", "state", "outputs", "resources"],
@@ -20,6 +20,7 @@
       "required": ["topic", "roles"],
       "properties": {
         "topic": {"type": "string", "minLength": 1},
+        "format": {"enum": ["protobuf", "json-envelope"]},
         "roles": {
           "type": "array",
           "minItems": 1,
@@ -28,7 +29,7 @@
             "additionalProperties": false,
             "required": ["role"],
             "properties": {
-              "role": {"enum": ["position_ecef_m", "pitch_deg", "roll_deg", "sample_time_ns", "component_temp_k", "ambient_temp_k", "record_time_ns", "fuel_remaining", "consumables", "wear_hours", "wear_rul", "active_fault_codes", "deploy_signal", "speed_mps", "sample_time_s"]},
+              "role": {"enum": ["position_ecef_m", "pitch_deg", "roll_deg", "sample_time_ns", "component_temp_k", "ambient_temp_k", "record_time_ns", "fuel_remaining", "consumables", "wear_hours", "wear_rul", "active_fault_codes", "deploy_signal", "speed_mps", "sample_time_s", "observed_at_s", "elements"]},
               "required": {"type": "boolean"}
             }
           }
@@ -82,7 +83,8 @@
         "additionalProperties": false,
         "required": ["kind", "topic", "direction", "labels"],
         "properties": {
-          "kind": {"enum": ["sustainment", "anomaly", "window", "latest_state", "posture_transition"]},
+          "kind": {"enum": ["sustainment", "anomaly", "window", "latest_state", "posture_transition", "band_crossing"]},
+          "many": {"type": "boolean"},
           "class": {"enum": ["value", "transition"]},
           "on_change_of": {"type": "string", "minLength": 1},
           "stamp": {"enum": ["producer", "none"]},
@@ -101,7 +103,7 @@
             "else": {"not": {"anyOf": [{"required": ["event_type"]}, {"required": ["severity"]}]}}
           },
           {
-            "if": {"properties": {"kind": {"enum": ["latest_state", "posture_transition"]}}, "required": ["kind"]},
+            "if": {"properties": {"kind": {"enum": ["latest_state", "posture_transition", "band_crossing"]}}, "required": ["kind"]},
             "then": {
               "required": ["stamp"],
               "properties": {"stamp": {"const": "none"}},
@@ -143,6 +145,31 @@
   ],
   "$defs": {
     "param": {
+      "oneOf": [{"$ref": "#/$defs/numericParam"}, {"$ref": "#/$defs/bandsParam"}]
+    },
+    "bandsParam": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "default"],
+      "properties": {
+        "type": {"const": "bands"},
+        "default": {
+          "type": "object",
+          "minProperties": 1,
+          "additionalProperties": {
+            "type": "object",
+            "required": ["limits", "names", "hysteresis", "severity"],
+            "properties": {
+              "limits": {"type": "array", "minItems": 1, "items": {"type": "number"}},
+              "names": {"type": "array", "minItems": 2, "items": {"type": "string", "minLength": 1}},
+              "hysteresis": {"type": "number", "minimum": 0},
+              "severity": {"type": "object", "additionalProperties": {"type": "string", "minLength": 1}}
+            }
+          }
+        }
+      }
+    },
+    "numericParam": {
       "type": "object",
       "additionalProperties": false,
       "required": ["type", "default"],
