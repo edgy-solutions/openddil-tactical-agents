@@ -265,3 +265,22 @@ def test_the_posture_declaration_passes_the_validator_and_the_schema():
     decl = d.validate(doc)
     assert [o.kind for o in decl.outputs] == ["latest_state", "posture_transition"]
     assert [f.name for f in decl.state_fields][-1] == "signal_ever_seen"
+
+
+def test_a_speed_exactly_at_the_threshold_reads_as_stationary():
+    """The boundary the recording never reaches (its minimum is 3.09 m/s): speed
+    must be strictly greater than move_speed_mps to count as moving."""
+    rig = Rig()
+    th = rig.params["move_speed_mps"]
+    records = [event("b", 100.0 + 5 * i, speed=6.0) for i in range(4)]            # moving by t=110
+    records += [event("b", 120.0 + 10 * i, speed=th) for i in range(4)]           # exactly at the threshold
+    postures = []
+    for i, raw in enumerate(records):
+        old, new = rig.feed(raw)
+        assert new == old, f"record {i}"
+        postures.append(rig.oracle.table["b"]["posture"])
+        assert rig.record_matches("b")
+    assert postures[3] == "moving"
+    assert rig.oracle.table["b"]["motion"] == "stationary"
+    assert postures[-1] == "unspecified"          # left moving: the exact value is stationary
+    assert rig.table["b"].motion == "stationary" and rig.table["b"].posture == "unspecified"
