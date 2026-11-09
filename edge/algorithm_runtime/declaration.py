@@ -14,6 +14,7 @@ emittable up the tier tree).
 """
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import re
@@ -29,13 +30,18 @@ API_VERSION = "openddil.io/algorithm/v1"
 RUNTIME = "stream-parallel"
 LABELS = "copy-source"
 # Output kind table. Each kind maps to an envelope field in outputs.py.
-OUTPUT_KINDS = ("sustainment", "anomaly")
+OUTPUT_KINDS = ("sustainment", "anomaly", "window")
 # An anomaly output names the CloudEvent type it emits and the severity the
 # contract stamps on it; the unit supplies neither.
 EVENT_TYPE = re.compile(r"^openddil\.anomaly\.[a-z0-9_.]+$")
 COMPOSITIONS = ("propagating", "terminal")
 DIRECTIONS = ("local", "upward")
 PARAM_TYPES = ("number", "integer")
+# State persistence. `durable` is a Faust Table (RocksDB, changelog-replicated);
+# `memory` is a per-process dict, lost on a restart, for state a unit may
+# rebuild from the live feed. Only memory state may hold an `object` field.
+PERSISTENCES = ("durable", "memory")
+STATE_FIELD_TYPES = PARAM_TYPES + ("object",)
 
 _TOP_KEYS = {
     "apiVersion", "unit", "version", "runtime", "entrypoint", "key",
@@ -63,7 +69,7 @@ class Param:
 class StateField:
     name: str
     type: str
-    default: int | float | None
+    default: int | float | dict | None
     nullable: bool = False
 
 
@@ -95,13 +101,14 @@ class Declaration:
     input_topic: str
     roles: tuple[InputRole, ...]
     params: tuple[Param, ...]
-    state_table: str
-    state_partitions: int
-    state_record_namespace: str
+    state_table: str | None             # None under memory persistence
+    state_partitions: int | None
+    state_record_namespace: str | None
     state_fields: tuple[StateField, ...]
     outputs: tuple[OutputDecl, ...]
     memory_mi: float
     cpu_m: float
+    state_persistence: str = "durable"
 
     def param(self, name: str) -> Param | None:
         return next((p for p in self.params if p.name == name), None)
@@ -206,25 +213,46 @@ def validate(raw: Any) -> Declaration:
             raise DeclarationError(f"{w}.unit: must be a string")
         params.append(Param(name, p["type"], default, lo, hi, p.get("unit")))
 
-    st = _mapping(d["state"], "state", {"table", "partitions", "record_namespace", "fields"},
-                  {"table", "partitions", "record_namespace", "fields"})
-    table = _string(st["table"], "state.table")
-    parts = st["partitions"]
-    if not isinstance(parts, int) or isinstance(parts, bool) or parts < 1:
-        raise DeclarationError("state.partitions: must be an integer >= 1")
-    ns = _string(st["record_namespace"], "state.record_namespace")
+    if not isinstance(d["state"], dict):
+        raise DeclarationError("state: must be a mapping")
+    persistence = d["state"].get("persistence", "durable")
+    if persistence not in PERSISTENCES:
+        raise DeclarationError(
+            f"state.persistence: {persistence!r} is not one of {list(PERSISTENCES)}")
+    table_keys = {"table", "partitions", "record_namespace"}
+    if persistence == "memory":
+        for k in sorted(table_keys & set(d["state"])):
+            raise DeclarationError(
+                f"state.{k}: a memory-persistence unit has no table, partitions or record namespace")
+        st = _mapping(d["state"], "state", {"persistence", "fields"}, {"fields"})
+        table = parts = ns = None
+    else:
+        st = _mapping(d["state"], "state", {"persistence"} | table_keys | {"fields"},
+                      table_keys | {"fields"})
+        table = _string(st["table"], "state.table")
+        parts = st["partitions"]
+        if not isinstance(parts, int) or isinstance(parts, bool) or parts < 1:
+            raise DeclarationError("state.partitions: must be an integer >= 1")
+        ns = _string(st["record_namespace"], "state.record_namespace")
     if not isinstance(st["fields"], dict) or not st["fields"]:
         raise DeclarationError("state.fields: must be a non-empty mapping")
     fields = []
     for name, f in st["fields"].items():
         w = f"state.fields.{name}"
         f = _mapping(f, w, {"type", "default", "nullable"}, {"type", "default"})
-        if f["type"] not in PARAM_TYPES:
-            raise DeclarationError(f"{w}.type: {f['type']!r} is not one of {list(PARAM_TYPES)}")
+        allowed = STATE_FIELD_TYPES if persistence == "memory" else PARAM_TYPES
+        if f["type"] not in allowed:
+            raise DeclarationError(f"{w}.type: {f['type']!r} is not one of {list(allowed)}")
         nullable = f.get("nullable", False)
         if not isinstance(nullable, bool):
             raise DeclarationError(f"{w}.nullable: must be a boolean")
-        if f["default"] is None:
+        if f["type"] == "object":
+            if nullable:
+                raise DeclarationError(f"{w}.nullable: an object field is never null")
+            if not isinstance(f["default"], dict):
+                raise DeclarationError(f"{w}.default: {f['default']!r} is not a mapping")
+            default = copy.deepcopy(f["default"])
+        elif f["default"] is None:
             if not nullable:
                 raise DeclarationError(f"{w}.default: null needs nullable: true")
             default = None
@@ -283,7 +311,7 @@ def validate(raw: Any) -> Declaration:
         composition=composition, input_topic=input_topic, roles=tuple(roles),
         params=tuple(params), state_table=table, state_partitions=parts,
         state_record_namespace=ns, state_fields=tuple(fields), outputs=tuple(outs),
-        memory_mi=res["memory_mi"], cpu_m=res["cpu_m"],
+        memory_mi=res["memory_mi"], cpu_m=res["cpu_m"], state_persistence=persistence,
     )
 
 

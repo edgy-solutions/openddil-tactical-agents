@@ -15,6 +15,16 @@ Files are named `<topic>.<first>-<last>.gz`. A changelog snapshot is read as a
 whole log: the state is the LAST value per key (JSON-encoded asset id), an
 empty value is a tombstone.
 
+Every record is given to the unit with its recording time (`ts_ms * 1_000_000`)
+as the `record_time_ns` role, as the runner gives the Faust message time.
+
+`--compare-oracle <name>` is a different mode: no recorded output side at all.
+It runs the frozen old path `tests/oracle/<name>_v0` and the unit over the same
+raw records, in order, from a cold start, with the same record time, and
+compares what each emits per asset and kind, exactly. `--synth-seed N` first
+lets the oracle package's `synth` fill values the recording lacks into each
+decoded event, so both sides see them.
+
 A unit with no `sustainment` output (an anomaly unit, say) has no recorded
 side this harness can align and compare, so it runs in COUNT-ONLY mode: every
 raw record goes through `process_one`, and the report carries the counters and
@@ -322,11 +332,11 @@ class _Replay:
 
     # -- raw side --------------------------------------------------------
     def run(self) -> Report:
-        for offset, _ts, _key, value in self.raw:
+        for offset, ts_ms, _key, value in self.raw:
             self.n_raw += 1
             if self.n_raw == self.overlap + 1:
                 self._end_overlap()
-            self._on_raw(offset, value)
+            self._on_raw(offset, value, ts_ms)
         self._finish()
         return self.r
 
@@ -335,7 +345,7 @@ class _Replay:
             if a.status == "pending":
                 self._unalign(a, self._no_match_reason())
 
-    def _on_raw(self, offset: int, value: bytes) -> None:
+    def _on_raw(self, offset: int, value: bytes, ts_ms: int) -> None:
         evt = pb.EntityTelemetryEvent()
         try:
             evt.ParseFromString(value)
@@ -343,12 +353,12 @@ class _Replay:
         except Exception:  # noqa: BLE001 - counted by process_one
             asset_id = ""
         if not asset_id:
-            self.counters.update(core.process_one(self.unit, self.decl, value, None)[2])
+            self.counters.update(core.process_one(self.unit, self.decl, value, None, ts_ms * 1_000_000)[2])
             return
         a = self._asset(asset_id)
         s = evt.provenance.sample_time
         st = (s.seconds, s.nanos) if (s.seconds or s.nanos) else None
-        entry = (offset, value, st is not None, st)
+        entry = (offset, value, st is not None, st, ts_ms)
         if a.status == "active":
             self._step(a, entry)
         elif a.status in ("pending", "collect"):
@@ -389,7 +399,8 @@ class _Replay:
                 continue
             state, outs = copy.deepcopy(a.snap), []
             for entry in a.buf[ci + 1: ci + 1 + _TRIAL_SAMPLES]:
-                new, sends, counters = core.process_one(self.unit, self.decl, entry[1], state)
+                new, sends, counters = core.process_one(self.unit, self.decl, entry[1], state,
+                                                        entry[4] * 1_000_000)
                 if counters.get("sample_time_fallback"):
                     outs = None
                     break
@@ -443,8 +454,9 @@ class _Replay:
 
     # -- the step --------------------------------------------------------
     def _step(self, a: _Asset, entry) -> None:
-        offset, value, has_st, _st = entry
-        new_state, sends, counters = core.process_one(self.unit, self.decl, value, a.state)
+        offset, value, has_st, _st, ts_ms = entry
+        new_state, sends, counters = core.process_one(self.unit, self.decl, value, a.state,
+                                                      ts_ms * 1_000_000)
         self.counters.update(counters)
         if counters.get("sample_time_fallback"):
             self.r.fallback_rows += 1
@@ -662,7 +674,8 @@ def _count_only(unit, decl, raw_records) -> Report:
     counters: Counter = Counter()
     emitted: Counter = Counter()
     n = 0
-    for _offset, _ts, _key, value in raw_records:
+    kinds = {o.topic: o.kind for o in decl.outputs}
+    for _offset, ts_ms, _key, value in raw_records:
         n += 1
         try:
             evt = pb.EntityTelemetryEvent()
@@ -670,12 +683,13 @@ def _count_only(unit, decl, raw_records) -> Report:
             asset_id = evt.asset.asset_id
         except Exception:  # noqa: BLE001 - counted by process_one
             asset_id = ""
-        new_state, sends, c = core.process_one(unit, decl, value, states.get(asset_id) if asset_id else None)
+        new_state, sends, c = core.process_one(unit, decl, value, states.get(asset_id) if asset_id else None,
+                                               ts_ms * 1_000_000)
         counters.update(c)
         if new_state is not None:
             states[asset_id] = new_state
-        for _topic, _key, msg in sends:
-            emitted["anomaly" if isinstance(msg, dict) else "sustainment"] += 1
+        for topic, _key, _msg in sends:
+            emitted[kinds[topic]] += 1
     r.topics = {decl.input_topic: n}
     r.core_counters = dict(counters)
     r.emitted = dict(emitted)
@@ -712,6 +726,200 @@ def replay(unit, decl, params, raw_records, snapshot, recorded_outputs, env,
                 os.environ[k] = v
 
 
+@dataclass
+class OracleReport:
+    """The `--compare-oracle` result. Counts and field paths only; asset ids
+    appear nowhere but `assets` (a count)."""
+    mode: str = "compare-oracle"
+    oracle: str = ""
+    topics: dict = field(default_factory=dict)
+    assets: int = 0
+    emitted_old: dict = field(default_factory=dict)        # kind -> count
+    emitted_new: dict = field(default_factory=dict)
+    compared: int = 0
+    equal: int = 0
+    different: int = 0
+    old_only: int = 0
+    new_only: int = 0
+    first_diffs: list = field(default_factory=list)
+    diff_by_field: dict = field(default_factory=dict)
+    stamp_failures: int = 0
+    core_counters: dict = field(default_factory=dict)
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+    def to_json(self) -> str:
+        return json.dumps(self.to_dict(), indent=1, sort_keys=True)
+
+
+def _norm_out(msg):
+    """A copy with what may differ cleared: the host wall clock and the new
+    stamp (the stamp is asserted on its own)."""
+    if isinstance(msg, dict):
+        out = copy.deepcopy(msg)
+        for k in ("id", "time"):
+            out.pop(k, None)
+        (out.get("data") or {}).pop("producer_stamp", None)
+        return out
+    out = type(msg)()
+    out.CopyFrom(msg)
+    if isinstance(msg, pb.EntityTelemetryEvent):
+        return _norm(out, True)
+    out.ClearField("computed_at")
+    out.provenance.ClearField("ingest_time")
+    out.provenance.ClearField("producer_stamp")
+    return out
+
+
+def _stamp_of(msg):
+    if isinstance(msg, dict):
+        ps = (msg.get("data") or {}).get("producer_stamp") or {}
+        return (ps.get("unit"), ps.get("version"), ps.get("config_hash"), ps.get("tier"))
+    ps = msg.provenance.producer_stamp
+    return (ps.unit, ps.version, ps.config_hash, ps.tier)
+
+
+def _diff_any(a, b) -> list[str]:
+    if isinstance(a, dict):
+        return sorted(k for k in set(a) | set(b) if a.get(k) != b.get(k)) or ["<dict>"]
+    return _diff_paths(a, b)
+
+
+def _load_oracle(name: str):
+    root = Path(__file__).resolve().parents[2] / "tests" / "oracle"
+    if str(root) not in sys.path:
+        sys.path.insert(0, str(root))
+    import importlib
+    try:
+        return importlib.import_module(f"{name}_v0")
+    except ImportError as exc:
+        raise ReplayInputError(f"--compare-oracle {name}: tests/oracle/{name}_v0 will not import: {exc}") from None
+
+
+def compare_oracle(unit, decl, params, raw_records, env, name: str, synth_seed: int | None = None,
+                   timing: dict | None = None) -> OracleReport:
+    """Run the frozen oracle `<name>_v0` and `unit` over the same raw records.
+
+    The oracle package offers `Oracle(params, edge_id, region_id)` with
+    `feed(raw, record_time_ns) -> [(kind, message)]`, optionally `normalize(kind,
+    message)` (applied to both sides) and `synth.make(seed)`. Both sides start
+    cold and see every record in order with the same record time; the unit's
+    state is kept per asset between records as the runner keeps it. Outputs
+    are paired in order per (asset, kind). `timing`, if given, receives the
+    seconds spent in each side."""
+    import time as _time
+    tier = env.get("OPENDDIL_EDGE_ID", "")
+    if not tier:
+        raise ReplayInputError("env has no OPENDDIL_EDGE_ID: every output is stamped with its tier")
+    pkg = _load_oracle(name)
+    saved = {k: os.environ.get(k) for k in ("OPENDDIL_EDGE_ID", "OPENDDIL_REGION_ID")}
+    spent = {"old": 0.0, "new": 0.0}
+    try:
+        for k in saved:
+            if env.get(k):
+                os.environ[k] = env[k]
+            else:
+                os.environ.pop(k, None)
+        oracle = pkg.Oracle(params, tier, env.get("OPENDDIL_REGION_ID", ""))
+        normalize = getattr(pkg, "normalize", lambda _kind, m: m)
+        fill = None
+        if synth_seed is not None:
+            try:
+                fill = pkg.synth.make(synth_seed)
+            except AttributeError:
+                raise ReplayInputError(f"--synth-seed: {name}_v0 has no synth.make(seed)") from None
+        kinds = {o.topic: o.kind for o in decl.outputs}
+        stamp = (decl.unit, decl.version, declaration.config_hash(decl.unit, decl.version, params), tier)
+        r = OracleReport(oracle=f"{name}_v0")
+        states: dict[str, dict] = {}
+        pending: dict[tuple, tuple[deque, deque]] = {}
+        counters: Counter = Counter()
+        emitted_old: Counter = Counter()
+        emitted_new: Counter = Counter()
+        diff_fields: Counter = Counter()
+        seen_assets: set = set()
+        n = 0
+
+        def compare(key, record_no):
+            old_q, new_q = pending[key]
+            while old_q and new_q:
+                (o_no, o_msg), (n_no, n_msg) = old_q.popleft(), new_q.popleft()
+                r.compared += 1
+                a, b = normalize(key[1], _norm_out(o_msg)), normalize(key[1], _norm_out(n_msg))
+                if a == b:
+                    r.equal += 1
+                    continue
+                r.different += 1
+                paths = _diff_any(a, b)
+                diff_fields.update(re.sub(r"\[\d+\]", "[]", p) for p in paths)
+                if len(r.first_diffs) < _MAX_FIRST_DIFFS:
+                    r.first_diffs.append({"kind": key[1], "old_record": o_no, "new_record": n_no, "paths": paths})
+
+        for _offset, ts_ms, _key, value in raw_records:
+            n += 1
+            asset_id = ""
+            if fill is not None:
+                evt = pb.EntityTelemetryEvent()
+                try:
+                    evt.ParseFromString(value)
+                except Exception:  # noqa: BLE001 - both sides see the bytes as they are
+                    evt = None
+                if evt is not None:
+                    fill(evt)
+                    value = evt.SerializeToString()
+            rt_ns = ts_ms * 1_000_000
+            try:
+                probe = pb.EntityTelemetryEvent()
+                probe.ParseFromString(value)
+                asset_id = probe.asset.asset_id
+            except Exception:  # noqa: BLE001 - counted by process_one
+                asset_id = ""
+            t0 = _time.perf_counter()
+            old_out = oracle.feed(value, rt_ns)
+            t1 = _time.perf_counter()
+            new_state, sends, c = core.process_one(unit, decl, value, states.get(asset_id) if asset_id else None, rt_ns)
+            t2 = _time.perf_counter()
+            spent["old"] += t1 - t0
+            spent["new"] += t2 - t1
+            counters.update(c)
+            if new_state is not None:
+                states[asset_id] = new_state
+            if asset_id:
+                seen_assets.add(asset_id)
+            touched = set()
+            for kind, msg in old_out:
+                emitted_old[kind] += 1
+                pending.setdefault((asset_id, kind), (deque(), deque()))[0].append((n, msg))
+                touched.add((asset_id, kind))
+            for topic, _k, msg in sends:
+                kind = kinds[topic]
+                emitted_new[kind] += 1
+                if _stamp_of(msg) != stamp:
+                    r.stamp_failures += 1
+                pending.setdefault((asset_id, kind), (deque(), deque()))[1].append((n, msg))
+                touched.add((asset_id, kind))
+            for key in touched:
+                compare(key, n)
+        for old_q, new_q in pending.values():
+            r.old_only += len(old_q)
+            r.new_only += len(new_q)
+        r.topics = {decl.input_topic: n}
+        r.assets = len(seen_assets)
+        r.emitted_old, r.emitted_new = dict(emitted_old), dict(emitted_new)
+        r.diff_by_field = dict(diff_fields)
+        r.core_counters = dict(counters)
+        if timing is not None:
+            timing.update(spent)
+        return r
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
 def load_unit(unit_dir: Path, decl: Declaration, params: Mapping) -> Unit:
     """The unit imported from file under the guard, by the runner's loader."""
     return loader.load_unit_class(unit_dir, decl, ReplayInputError)(params)
@@ -725,6 +933,25 @@ def _expand(pattern: str, what: str) -> list[str]:
     if not files:
         raise ReplayInputError(f"--{what} {pattern!r} matches no file")
     return files
+
+
+def _oracle_summary(r: OracleReport, out: str, timing: dict) -> list[str]:
+    fmt = lambda d: ", ".join(f"{k}={n}" for k, n in sorted(d.items())) or "none"  # noqa: E731
+    lines = [
+        f"mode: COMPARE-ORACLE against {r.oracle}: both sides over the same raw records, from a cold start",
+        f"records: {fmt(r.topics)}   assets: {r.assets}",
+        f"emitted_old: {fmt(r.emitted_old)}   emitted_new: {fmt(r.emitted_new)}",
+        f"compared={r.compared} equal={r.equal} different={r.different} "
+        f"old_only={r.old_only} new_only={r.new_only}",
+        f"stamp_failures={r.stamp_failures}",
+        "counters: " + (" ".join(f"{k}={n}" for k, n in sorted(r.core_counters.items())) or "none"),
+    ]
+    if r.diff_by_field:
+        lines.append("different by field: " + ", ".join(f"{k}={v}" for k, v in list(r.diff_by_field.items())[:6]))
+    if timing:
+        lines.append(f"wall seconds in each side: old={timing['old']:.2f} new={timing['new']:.2f}")
+    lines.append(f"report: {out}")
+    return lines
 
 
 def _summary(r: Report, out: str) -> list[str]:
@@ -771,6 +998,10 @@ def main(argv=None) -> int:
     ap.add_argument("--overlap", type=int, default=_OVERLAP,
                     help="raw records in which a snapshot asset's sample must be found")
     ap.add_argument("--oracle", action="store_true", help="diagnostic: attribute each difference via the frozen engine")
+    ap.add_argument("--compare-oracle", metavar="NAME",
+                    help="run tests/oracle/NAME_v0 and the unit over the same raw records and compare exactly")
+    ap.add_argument("--synth-seed", type=int,
+                    help="with --compare-oracle: fill values the recording lacks, from the oracle package's synth")
     args = ap.parse_args(argv)
     try:
         unit_dir = Path(args.unit_dir)
@@ -784,6 +1015,18 @@ def main(argv=None) -> int:
         params = declaration.resolve_params(decl, overrides)
         unit = load_unit(unit_dir, decl, params)
         raw = _expand(args.raw, "raw")
+        if args.synth_seed is not None and not args.compare_oracle:
+            raise ReplayInputError("--synth-seed needs --compare-oracle")
+        if args.compare_oracle:
+            timing: dict = {}
+            orep = compare_oracle(
+                unit, decl, params, read_records(raw),
+                {"OPENDDIL_EDGE_ID": args.edge_id, "OPENDDIL_REGION_ID": args.region_id},
+                args.compare_oracle, args.synth_seed, timing)
+            Path(args.out).write_text(orep.to_json(), encoding="utf-8")
+            print("\n".join(_oracle_summary(orep, args.out, timing)))
+            bad = orep.different or orep.old_only or orep.new_only or orep.stamp_failures
+            return 0 if not bad else 1
         count_only = not any(o.kind == "sustainment" for o in decl.outputs)
         if count_only:
             snapshot, recorded, end = {}, [], None

@@ -32,6 +32,20 @@ ROLES: dict[str, str] = {
     # the source stated; present only when the source set the quantity.
     "component_temp_k": "float",
     "ambient_temp_k": "float",
+    # The input record's broker timestamp (ms * 1_000_000), passed to the core by
+    # the runner (the Faust message time) or the replay (the recording line's
+    # ts_ms). It is not read from the event, and is present only when given.
+    "record_time_ns": "int",
+    # Sustainment, from the event's own quantities (host side, through pint).
+    # A quantity is (magnitude, unit) with unit = str(pint units), and is
+    # absent when the source left it unset or stated a unit pint cannot read.
+    "fuel_remaining": "tuple[float, str]",
+    # {slot: {"remaining": float, "capacity": <as the proto gives it>, "nsn": str}},
+    # every item in the event, in the proto's map order.
+    "consumables": "dict[str, dict]",
+    "wear_hours": "dict[str, tuple[float, str]]",
+    "wear_rul": "dict[str, tuple[float, str]]",
+    "active_fault_codes": "tuple[str, ...]",
 }
 
 

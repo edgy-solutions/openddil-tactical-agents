@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://openddil.io/algorithm/v1/declaration.schema.json",
   "title": "Algorithm unit declaration, openddil.io/algorithm/v1",
-  "description": "Mirrors edge/algorithm_runtime/declaration.py. One rule is not expressible here: a param default must lie within its own minimum/maximum, which the runtime validator enforces.",
+  "description": "Mirrors edge/algorithm_runtime/declaration.py. One rule is not expressible here: a param default must lie within its own minimum/maximum, which the runtime validator enforces. An object state field is allowed only under persistence: memory; a memory unit has no table, partitions or record_namespace.",
   "type": "object",
   "additionalProperties": false,
   "required": ["apiVersion", "unit", "version", "runtime", "entrypoint", "key", "composition", "inputs", "params", "state", "outputs", "resources"],
@@ -28,7 +28,7 @@
             "additionalProperties": false,
             "required": ["role"],
             "properties": {
-              "role": {"enum": ["position_ecef_m", "pitch_deg", "roll_deg", "sample_time_ns", "component_temp_k", "ambient_temp_k"]},
+              "role": {"enum": ["position_ecef_m", "pitch_deg", "roll_deg", "sample_time_ns", "component_temp_k", "ambient_temp_k", "record_time_ns", "fuel_remaining", "consumables", "wear_hours", "wear_rul", "active_fault_codes"]},
               "required": {"type": "boolean"}
             }
           }
@@ -42,8 +42,9 @@
     "state": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["table", "partitions", "record_namespace", "fields"],
+      "required": ["fields"],
       "properties": {
+        "persistence": {"enum": ["durable", "memory"]},
         "table": {"type": "string", "minLength": 1},
         "partitions": {"type": "integer", "minimum": 1},
         "record_namespace": {"type": "string", "minLength": 1},
@@ -52,7 +53,17 @@
           "minProperties": 1,
           "additionalProperties": {"$ref": "#/$defs/stateField"}
         }
-      }
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"persistence": {"const": "memory"}}, "required": ["persistence"]},
+          "then": {"not": {"anyOf": [{"required": ["table"]}, {"required": ["partitions"]}, {"required": ["record_namespace"]}]}},
+          "else": {
+            "required": ["table", "partitions", "record_namespace"],
+            "properties": {"fields": {"additionalProperties": {"properties": {"type": {"enum": ["number", "integer"]}}}}}
+          }
+        }
+      ]
     },
     "outputs": {
       "type": "array",
@@ -62,7 +73,7 @@
         "additionalProperties": false,
         "required": ["kind", "topic", "direction", "producer_id", "source_protocol", "labels"],
         "properties": {
-          "kind": {"enum": ["sustainment", "anomaly"]},
+          "kind": {"enum": ["sustainment", "anomaly", "window"]},
           "topic": {"type": "string", "minLength": 1},
           "direction": {"enum": ["local", "upward"]},
           "producer_id": {"type": "string", "minLength": 1},
@@ -117,6 +128,18 @@
       "then": {"properties": {"default": {"type": "integer"}}}
     },
     "stateField": {
+      "oneOf": [{"$ref": "#/$defs/numericStateField"}, {"$ref": "#/$defs/objectStateField"}]
+    },
+    "objectStateField": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "default"],
+      "properties": {
+        "type": {"const": "object"},
+        "default": {"type": "object"}
+      }
+    },
+    "numericStateField": {
       "type": "object",
       "additionalProperties": false,
       "required": ["type", "default"],

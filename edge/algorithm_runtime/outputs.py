@@ -6,16 +6,38 @@ confidence 0.0) is the contract's to state, never the unit's, so a payload
 that tries to carry its own `value_provenance` is refused. The same holds for
 an anomaly payload: severity, labels, provenance and the rest of the envelope
 are stated here from the declaration and the source, never by the unit.
+
+The `window` kind: a WindowedTelemetry on the windows topic. The unit's
+payload is plain numbers, all required unless marked optional:
+
+    {"window_start_ns": int, "window_end_ns": int, "sample_count": int,
+     "fluid_trends": {signal: TREND},
+     "consumable_trends": [{"slot_key": str, "remaining": TREND,
+                            "capacity": number (optional), "nsn": str (optional)}],
+     "wear_trends": [{"component_key": str, "hours_in_service": TREND (optional),
+                      "remaining_useful_life": TREND (optional)}],
+     "active_fault_codes": [str]}
+    TREND = {"latest": float, "latest_unit": str, "slope": float, "slope_unit": str,
+             "r_squared": float, "latest_sample_ns": int, "window_start_ns": int,
+             "sample_count": int}
+
+A unit is a pint unit name, as `str(pint units)`; the slope is per hour and is
+given in `slope_unit`, which the builder turns into `slope_unit + "/h"`
+through pint, so the strings on the wire are formatted as the original window
+path formatted them (`detection.windows`). The envelope (asset, labels,
+provenance, computed_at, the element rollup) is the contract's, as above.
 """
 from __future__ import annotations
 
 import json
 import os
+import time
 import uuid
 from datetime import datetime, timezone
 from typing import Mapping
 
 from google.protobuf import json_format
+from openddil.logistics.v1 import windowed_telemetry_pb2 as winpb
 from openddil.telemetry.v1 import telemetry_pb2 as pb
 
 from algorithm_runtime.declaration import OutputDecl
@@ -48,11 +70,63 @@ def _anomaly_payload(payload: Mapping) -> dict:
     return {"summary": payload["summary"], "evidence": dict(evidence)}
 
 
-def build_payload(kind: str, payload: Mapping) -> pb.SustainmentMetrics | dict:
+def _trend_proto(t: Mapping) -> winpb.ScalarTrend:
+    """A TREND dict as the wire ScalarTrend, through `detection.windows` so
+    pint formats the unit strings."""
+    from detection import windows  # pint is slow to import; only a window output pays for it
+    try:
+        latest = windows._ureg.Quantity(float(t["latest"]), t["latest_unit"])
+        slope = windows._ureg.Quantity(float(t["slope"]), t["slope_unit"] + "/h")
+        return windows.trend_to_proto(windows.TrendResult(
+            latest=latest, slope=slope, r_squared=float(t["r_squared"]),
+            sample_count=int(t["sample_count"]), window_start_ns=int(t["window_start_ns"]),
+            window_end_ns=0, latest_sample_ns=int(t["latest_sample_ns"])))
+    except (KeyError, TypeError, ValueError, AttributeError) as exc:
+        raise OutputError(f"window trend is malformed: {exc!r}") from exc
+    except Exception as exc:  # noqa: BLE001 - pint's undefined-unit errors
+        raise OutputError(f"window trend has a unit pint cannot read: {exc}") from exc
+
+
+def _window_payload(payload: Mapping) -> winpb.WindowedTelemetry:
+    from detection import windows
+    try:
+        out = winpb.WindowedTelemetry()
+        for signal, t in payload["fluid_trends"].items():
+            out.fluid_trends[signal].CopyFrom(_trend_proto(t))
+        for c in payload["consumable_trends"]:
+            item = out.consumable_trends.add()
+            item.slot_key = c["slot_key"]
+            item.remaining.CopyFrom(_trend_proto(c["remaining"]))
+            if "capacity" in c:
+                item.capacity = c["capacity"]
+            if "nsn" in c:
+                item.nsn = c["nsn"]
+        for w in payload["wear_trends"]:
+            item = out.wear_trends.add()
+            item.component_key = w["component_key"]
+            if "hours_in_service" in w:
+                item.hours_in_service.CopyFrom(_trend_proto(w["hours_in_service"]))
+            if "remaining_useful_life" in w:
+                item.remaining_useful_life.CopyFrom(_trend_proto(w["remaining_useful_life"]))
+        out.active_fault_codes_latest.extend(payload["active_fault_codes"])
+        out.window.CopyFrom(windows.build_window_spec(
+            window_start_ns=int(payload["window_start_ns"]),
+            window_end_ns=int(payload["window_end_ns"]),
+            sample_count=int(payload["sample_count"])))
+    except OutputError:
+        raise
+    except (KeyError, TypeError, ValueError, AttributeError) as exc:
+        raise OutputError(f"payload is not a window: {exc!r}") from exc
+    return out
+
+
+def build_payload(kind: str, payload: Mapping) -> pb.SustainmentMetrics | winpb.WindowedTelemetry | dict:
     """Typed message for one output kind (a dict for an anomaly: its wire
     form is JSON, not a proto)."""
     if kind == "anomaly":
         return _anomaly_payload(payload)
+    if kind == "window":
+        return _window_payload(payload)
     if kind != "sustainment":
         raise OutputError(f"unknown output kind {kind!r}")
     if "value_provenance" in payload:
@@ -88,7 +162,8 @@ def build_event(
     version: str,
     config_hash: str,
     tier: str,
-) -> pb.EntityTelemetryEvent | dict:
+    rollup: winpb.ElementRollup | None = None,
+) -> pb.EntityTelemetryEvent | winpb.WindowedTelemetry | dict:
     """Build the output envelope. A sustainment output is a fresh EntityTelemetryEvent carrying only
     the derived sustainment + identity + provenance. No kinematics are
     echoed; consumers correlate by asset_id with the input stream. An anomaly
@@ -96,6 +171,9 @@ def build_event(
     if out.kind == "anomaly":
         return _anomaly_event(src, sustainment, out, unit=unit, version=version,
                               config_hash=config_hash, tier=tier)
+    if out.kind == "window":
+        return _window_event(src, sustainment, out, unit=unit, version=version,
+                             config_hash=config_hash, tier=tier, rollup=rollup)
     evt = pb.EntityTelemetryEvent()
     evt.event_id = str(uuid.uuid4())
     evt.schema_revision = 1
@@ -159,6 +237,54 @@ def build_event(
     evt.provenance.producer_stamp.config_hash = config_hash
     evt.provenance.producer_stamp.tier = tier
     return evt
+
+
+def _window_event(
+    src: pb.EntityTelemetryEvent,
+    window: winpb.WindowedTelemetry,
+    out: OutputDecl,
+    *,
+    unit: str,
+    version: str,
+    config_hash: str,
+    tier: str,
+    rollup: winpb.ElementRollup | None,
+) -> winpb.WindowedTelemetry:
+    """The WindowedTelemetry envelope, as the original window path built it:
+    asset identity and variant from the source, `computed_at` and
+    `provenance.ingest_time` the host wall clock, `sample_time` copied only
+    when the source set it, the origin node from the env, and the source's
+    releasability labels copied whole (ADR-0029 section 3: one asset's own
+    samples, one author; no else-branch and no default, so an unlabelled
+    source gives an unlabelled window for the gate to refuse). No
+    `source_protocol`: the original window carried none. The element rollup the
+    host holds for the asset, if any, rides along, because the element path
+    writes the same key and neither producer may clear the other's part."""
+    ev = winpb.WindowedTelemetry()
+    ev.CopyFrom(window)
+    now_ns = time.time_ns()
+    ev.asset_id = src.asset.asset_id
+    ev.platform_variant = src.asset.platform_variant or ""
+    ev.computed_at.FromNanoseconds(now_ns)
+    st = src.provenance.sample_time
+    if st.seconds or st.nanos:
+        ev.provenance.sample_time.CopyFrom(st)
+    ev.provenance.producer_id = out.producer_id
+    ev.provenance.edge_id = tier
+    ev.provenance.region_id = os.getenv("OPENDDIL_REGION_ID", "region-01")
+    ev.provenance.ingest_time.FromNanoseconds(now_ns)
+    ev.provenance.classification = "U"
+    if src.provenance.originator_nation:
+        ev.provenance.originator_nation = src.provenance.originator_nation
+    if src.provenance.releasable_to:
+        ev.provenance.releasable_to.extend(src.provenance.releasable_to)
+    ev.provenance.producer_stamp.unit = unit
+    ev.provenance.producer_stamp.version = version
+    ev.provenance.producer_stamp.config_hash = config_hash
+    ev.provenance.producer_stamp.tier = tier
+    if rollup is not None:
+        ev.element_rollup.CopyFrom(rollup)
+    return ev
 
 
 def _anomaly_event(

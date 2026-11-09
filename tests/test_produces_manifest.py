@@ -208,7 +208,8 @@ def test_declared_unit_outputs_and_changelogs_are_in_the_manifest(monkeypatch):
         decl = declaration.load(unit_dir / "unit.yaml")
         for out in decl.outputs:
             assert out.topic in declared, f"{decl.unit}: output {out.topic} not in produces.yaml"
-        assert pm.expand("${FAUST_APP_ID:-openddil-edge}-" + decl.state_table + "-changelog", env) in declared
+        if decl.state_persistence == "durable":      # a memory unit has no table, so no changelog
+            assert pm.expand("${FAUST_APP_ID:-openddil-edge}-" + decl.state_table + "-changelog", env) in declared
 
 
 def test_manifest_covers_exactly_both_images():
