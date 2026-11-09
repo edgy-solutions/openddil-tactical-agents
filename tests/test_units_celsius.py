@@ -68,3 +68,65 @@ def test_from_proto_wrappers_accept_cel(fn, build, key):
 def test_position_to_pint_accepts_cel_through_the_wrappers():
     out = units.position_to_pint(pb.Position(ecef=pb.EcefPosition(x=_q(1.0, "Cel"))))
     assert out["x"].to("kelvin").magnitude == _kelvin(1.0)
+
+
+# ---------------------------------------------------------------------------
+# One shared table (openddil.common.v1.ucum). The service no longer keeps a copy.
+# ---------------------------------------------------------------------------
+from openddil.common.v1 import ucum  # noqa: E402
+
+from detection import windows  # noqa: E402
+
+
+# Identity: before the change each module held its own dict, so `is` failed.
+def test_both_modules_use_the_shared_table_object():
+    assert units._UCUM_TO_PINT is ucum.UCUM_TO_PINT
+    assert windows._UCUM_TO_PINT is ucum.UCUM_TO_PINT
+
+
+# windows.proto_to_pint: its copy lacked "Cel" and the function swallows the
+# error, so it returned None.
+def test_windows_proto_to_pint_reads_cel_as_degc():
+    pq = windows.proto_to_pint(_q(92.0, "Cel"))
+    assert pq is not None and pq.check("[temperature]")
+    assert pq.to("kelvin").magnitude == pytest.approx(365.15)
+
+
+# Every shared code must resolve, through each module's own table, to a unit in
+# that module's own registry. Before the change windows' copy had no "Cel"
+# entry, so its lookup failed.
+@pytest.mark.parametrize("code", sorted(ucum.UCUM_TO_PINT))
+def test_every_table_value_parses_in_each_registry(code):
+    units.ureg.Unit(units._UCUM_TO_PINT[code])
+    windows._ureg.Unit(windows._UCUM_TO_PINT[code])
+
+
+# Old versus new, per consumer. RED-EXEMPT: the old table is frozen here
+# verbatim, and the old and new code agree on it, so this passes on both.
+# Cel is not in the old table and is covered by the tests above.
+_OLD_TABLE = {
+    "[degF]": "degF",
+    "[kn_i]": "knot",
+    "gal_us": "gallon",
+    "1": "dimensionless",
+}
+_MAGNITUDES = [0.0, -40.0, 1.5, 92.0, 1234.5]
+
+
+def _same(new, reg, code, value):
+    old = reg.Quantity(value, _OLD_TABLE.get(code, code)).to_base_units()
+    new = new.to_base_units()
+    assert new.magnitude == old.magnitude
+    assert new.units == old.units
+
+
+@pytest.mark.parametrize("value", _MAGNITUDES)
+@pytest.mark.parametrize("code", sorted(_OLD_TABLE))
+def test_old_codes_convert_as_before_through_from_proto(code, value):
+    _same(units.from_proto(_q(value, code)), units.ureg, code, value)
+
+
+@pytest.mark.parametrize("value", _MAGNITUDES)
+@pytest.mark.parametrize("code", sorted(_OLD_TABLE))
+def test_old_codes_convert_as_before_through_windows(code, value):
+    _same(windows.proto_to_pint(_q(value, code)), windows._ureg, code, value)

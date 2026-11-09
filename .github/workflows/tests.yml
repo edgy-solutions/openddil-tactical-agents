@@ -35,10 +35,9 @@ jobs:
           PB=$(python -c "import google.protobuf as p; print(p.__version__)")
           pip install "grpcio-tools" "protobuf==$PB"
           cd openddil-contracts
-          mkdir -p gen/python
-          python -m grpc_tools.protoc --proto_path=proto --python_out=gen/python $(find proto -name '*.proto')
+          make python PROTOC="python -m grpc_tools.protoc"
           echo "generated $(find gen/python -name '*_pb2.py' | wc -l) protobuf modules"
-          PYTHONPATH=gen/python python -c "from openddil.telemetry.v1 import telemetry_pb2"
+          PYTHONPATH=gen/python python -c "from openddil.telemetry.v1 import telemetry_pb2; from openddil.common.v1 import ucum"
       - name: produces manifest equals the code
         env:
           PYTHONPATH: ${{ github.workspace }}/openddil-contracts/gen/python

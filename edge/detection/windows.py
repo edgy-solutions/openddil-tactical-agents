@@ -26,13 +26,7 @@ from google.protobuf import timestamp_pb2, duration_pb2
 from openddil.common.v1 import quantity_pb2 as qpb
 from openddil.logistics.v1 import windowed_telemetry_pb2 as win
 
-# Shared UCUM-to-pint dialect — kept in sync with detection.units.
-_UCUM_TO_PINT = {
-    "[degF]": "degF",
-    "[kn_i]": "knot",
-    "gal_us": "gallon",
-    "1":      "dimensionless",
-}
+from openddil.common.v1.ucum import UCUM_TO_PINT as _UCUM_TO_PINT
 
 _ureg = UnitRegistry()
 
