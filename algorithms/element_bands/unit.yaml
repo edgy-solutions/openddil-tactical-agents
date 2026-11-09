@@ -1,0 +1,35 @@
+apiVersion: openddil.io/algorithm/v1
+unit: element_bands
+version: "1.0.0"
+runtime: stream-parallel          # ADR-0034 execution class; the only one this runner accepts
+entrypoint: element_bands_unit.py:ElementBands
+key: asset_id
+composition: propagating          # ADR-0034 composition typing
+inputs:
+  topic: asset-element-telemetry
+  format: json-envelope           # the element snapshot; the host gates it (object, asset id, a rollup) before the step
+  roles:
+    - {role: observed_at_s, required: true}   # observed_at_ns / 1e9; an envelope without a numeric one yields nothing
+    - {role: elements, required: true}        # (element_id, layer_name, raw element) in envelope order
+params:                            # the element health bands: the numbers the chart's elementState.healthBands held
+  bands:
+    type: bands
+    default:
+      health:
+        limits: [0.90, 0.97]       # health rises toward worse; the frontend's yellow > 0.90 and red > 0.97
+        names: [green, yellow, red]
+        hysteresis: 0.01
+        severity: {green: info, yellow: warn, red: crit}
+state:
+  persistence: memory              # lost on a restart, as the old tracker was: the first observation after it is silent
+  fields:
+    bands_by_key: {type: object, default: {}}   # {element_id: {field: band index}} for this asset
+outputs:
+  - kind: band_crossing            # the openddil.element.band CloudEvent on tactical-events
+    topic: tactical-events
+    direction: local
+    many: true                     # one per crossing, any number per envelope; an empty list sends nothing
+    stamp: none                    # the event's shape stays what it was before this unit existed
+    labels: copy-source
+resources: {memory_mi: 8, cpu_m: 10}   # unmeasured; a ceiling for the render check, not a measurement
+dependencies: []                   # must be empty: dependencies ship in the image, never fetched

@@ -67,3 +67,23 @@ def make_posture(overrides=None):
     sys.modules[name] = module
     spec.loader.exec_module(module)
     return module.Posture(declaration.resolve_params(decl, overrides)), decl
+
+
+BANDS_DIR = ROOT / "algorithms" / "element_bands"
+
+
+def bands_decl() -> declaration.Declaration:
+    return declaration.load(BANDS_DIR / "unit.yaml")
+
+
+def make_element_bands(overrides=None):
+    """(unit, decl) for the element_bands unit, loaded by file under the guard
+    as the runner does, with `overrides` applied to its declared defaults."""
+    decl = bands_decl()
+    guard.check_unit_dir(BANDS_DIR)
+    name = "openddil_algorithms.element_bands"
+    spec = importlib.util.spec_from_file_location(name, BANDS_DIR / "element_bands_unit.py")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module.ElementBands(declaration.resolve_params(decl, overrides)), decl
