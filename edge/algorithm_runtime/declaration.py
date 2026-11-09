@@ -15,6 +15,7 @@ emittable up the tier tree).
 from __future__ import annotations
 
 import copy
+import datetime
 import hashlib
 import json
 import re
@@ -64,9 +65,18 @@ DURABLE_FIELD_TYPES = PARAM_TYPES + ("string",)
 _TOP_KEYS = {
     "apiVersion", "unit", "version", "runtime", "entrypoint", "key",
     "composition", "inputs", "params", "state", "outputs", "resources",
-    "dependencies",
+    "measured", "dependencies",
 }
-_REQUIRED_TOP = _TOP_KEYS - {"dependencies"}
+_REQUIRED_TOP = _TOP_KEYS - {"dependencies", "measured"}
+
+# `measured`: what a --measure run over a recording found, with its date. A unit
+# without one loads (a new unit is measured later); the runner refuses to start it.
+MEASURED_BASES = ("recorded", "recorded-timing-synthetic-values")
+_MEASURED_KEYS = {
+    "date", "recording", "basis", "host", "records", "assets", "rate_per_s",
+    "per_sample_us", "peak_python_mib", "state_bytes_per_asset",
+}
+_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 
 class DeclarationError(ValueError):
@@ -133,6 +143,7 @@ class Declaration:
     cpu_m: float
     state_persistence: str = "durable"
     input_format: str = "protobuf"
+    measured: Mapping | None = None     # the unit's measured block, or None
 
     def param(self, name: str) -> Param | None:
         return next((p for p in self.params if p.name == name), None)
@@ -211,6 +222,31 @@ def _string(v: Any, where: str) -> str:
     if not isinstance(v, str) or not v:
         raise DeclarationError(f"{where}: must be a non-empty string")
     return v
+
+
+def _measured(raw: Any) -> dict:
+    m = _mapping(raw, "measured", _MEASURED_KEYS, _MEASURED_KEYS)
+    for k in ("date", "recording", "host"):
+        _string(m[k], f"measured.{k}")
+    try:
+        if not _DATE.match(m["date"]):
+            raise ValueError
+        datetime.date.fromisoformat(m["date"])
+    except ValueError:
+        raise DeclarationError(f"measured.date: {m['date']!r} must be a quoted YYYY-MM-DD string") from None
+    if m["basis"] not in MEASURED_BASES:
+        raise DeclarationError(f"measured.basis: {m['basis']!r} is not one of {list(MEASURED_BASES)}")
+    for k in ("records", "assets", "state_bytes_per_asset"):
+        if isinstance(m[k], bool) or not isinstance(m[k], int) or m[k] < 0:
+            raise DeclarationError(f"measured.{k}: must be a non-negative integer")
+    for k in ("rate_per_s", "peak_python_mib"):
+        if not _is_num(m[k]) or m[k] < 0:
+            raise DeclarationError(f"measured.{k}: must be a non-negative number")
+    us = _mapping(m["per_sample_us"], "measured.per_sample_us", {"mean", "p99", "max"}, {"mean", "p99", "max"})
+    for k, v in us.items():
+        if not _is_num(v) or v < 0:
+            raise DeclarationError(f"measured.per_sample_us.{k}: must be a non-negative number")
+    return copy.deepcopy(dict(m))
 
 
 def validate(raw: Any) -> Declaration:
@@ -424,13 +460,15 @@ def validate(raw: Any) -> Declaration:
         if not _is_num(res[k]) or res[k] <= 0:
             raise DeclarationError(f"resources.{k}: must be a positive number")
 
+    measured = _measured(d["measured"]) if "measured" in d else None
+
     return Declaration(
         unit=unit, version=version, entrypoint=entrypoint, key="asset_id",
         composition=composition, input_topic=input_topic, roles=tuple(roles),
         params=tuple(params), state_table=table, state_partitions=parts,
         state_record_namespace=ns, state_fields=tuple(fields), outputs=tuple(outs),
         memory_mi=res["memory_mi"], cpu_m=res["cpu_m"], state_persistence=persistence,
-        input_format=input_format,
+        input_format=input_format, measured=measured,
     )
 
 

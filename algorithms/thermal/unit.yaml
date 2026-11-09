@@ -33,5 +33,16 @@ outputs:
     labels: copy-source            # the only accepted value until ADR-0055 (high-water)
     event_type: openddil.anomaly.thermal.runaway.v1
     severity: critical
-resources: {memory_mi: 8, cpu_m: 10}   # unmeasured; a ceiling for the render check, not a measurement
+resources: {memory_mi: 1, cpu_m: 1}   # the larger edge's measured peak and mean cpu, no margin; leaves out Faust and RocksDB overhead, broker client buffers and the pod's own CPU (host is not the edge node)
+measured:
+  date: "2026-11-09"
+  recording: "second lab, rev 30, t0 2026-11-08T02:12:42Z, through the 02:23Z pull"
+  basis: recorded-timing-synthetic-values
+  host: "lane 03 dev host, not the edge node; python 3.11.1"
+  records: 157689
+  assets: 9
+  rate_per_s: 1.799
+  per_sample_us: {mean: 65.73, p99: 149.8, max: 398707.1}
+  peak_python_mib: 0.124
+  state_bytes_per_asset: 120
 dependencies: []                   # must be empty: dependencies ship in the image, never fetched

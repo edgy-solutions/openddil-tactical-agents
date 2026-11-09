@@ -160,3 +160,79 @@ def test_config_hash_is_canonical_and_tracks_every_input():
     assert h != d.config_hash("wear", "1.0.0", {**p, "critical_fraction": 0.99})
     # an override equal to the default is the same effective config
     assert h == d.config_hash("wear", "1.0.0", d.resolve_params(wear_decl(), {"track_life_total_km": 5000}))
+
+
+# ---- the measured block ----------------------------------------------------
+MEASURED = {
+    "date": "2026-11-09", "recording": "second lab, rev 30, t0 2026-11-08T02:12:42Z, through the 2026-11-09T02:23Z pull",
+    "basis": "recorded", "host": "lane 03 dev host, not the edge node; python 3.12",
+    "records": 100, "assets": 3, "rate_per_s": 1.5,
+    "per_sample_us": {"mean": 100.0, "p99": 250.0, "max": 9000.0},
+    "peak_python_mib": 0.12, "state_bytes_per_asset": 375,
+}
+
+
+def with_measured(mutation=None):
+    doc = copy.deepcopy(VALID)
+    doc["measured"] = copy.deepcopy(MEASURED)
+    if mutation:
+        mutation(doc)
+    return doc
+
+
+def test_a_unit_without_a_measured_block_loads():
+    doc = copy.deepcopy(VALID)
+    doc.pop("measured", None)
+    assert d.validate(doc).measured is None
+    assert schema_errors(doc) == []
+
+
+def test_a_measured_block_loads_and_the_schema_accepts_it():
+    decl = d.validate(with_measured())
+    assert decl.measured == MEASURED
+    assert schema_errors(with_measured()) == []
+    ok = with_measured(lambda doc: doc["measured"].update(basis="recorded-timing-synthetic-values"))
+    assert d.validate(ok).measured["basis"] == "recorded-timing-synthetic-values"
+
+
+MEASURED_REFUSALS = [
+    ("unknown key", lambda m: m.update(extra=1), "extra", True),
+    ("missing key", lambda m: m.pop("host"), "host", True),
+    ("missing per_sample_us.p99", lambda m: m["per_sample_us"].pop("p99"), "p99", True),
+    ("unknown per_sample_us key", lambda m: m["per_sample_us"].update(p50=1.0), "p50", True),
+    ("date not a date", lambda m: m.update(date="09-11-2026"), "measured.date", True),
+    ("date not a calendar date", lambda m: m.update(date="2026-13-45"), "measured.date", False),
+    ("date left unquoted (yaml makes it a date)", lambda m: m.update(date=__import__("datetime").date(2026, 11, 9)),
+     "measured.date", True),
+    ("basis", lambda m: m.update(basis="estimated"), "measured.basis", True),
+    ("records not an integer", lambda m: m.update(records=1.5), "measured.records", True),
+    ("negative rate", lambda m: m.update(rate_per_s=-1.0), "measured.rate_per_s", True),
+    ("per_sample_us negative", lambda m: m["per_sample_us"].update(mean=-1.0), "per_sample_us.mean", True),
+]
+
+
+@pytest.mark.parametrize("name,mutation,needle,expressible", MEASURED_REFUSALS, ids=[r[0] for r in MEASURED_REFUSALS])
+def test_measured_refusals_name_the_key_and_the_schema_agrees(name, mutation, needle, expressible):
+    doc = with_measured(lambda x: mutation(x["measured"]))
+    with pytest.raises(d.DeclarationError) as e:
+        d.validate(doc)
+    assert needle in str(e.value)
+    if expressible and name != "date left unquoted (yaml makes it a date)":
+        assert schema_errors(doc), f"schema accepted a measured block the validator refuses: {name}"
+
+
+def test_a_measured_block_and_changed_resources_leave_config_hash_where_it_was():
+    from algorithm_runtime import core
+
+    class U:  # `_stamp_hash` reads only `params`
+        pass
+    plain = copy.deepcopy(VALID)
+    plain.pop("measured", None)
+    changed = with_measured(lambda doc: doc["resources"].update(memory_mi=1, cpu_m=1))
+    hashes = []
+    for doc in (plain, changed):
+        decl = d.validate(doc)
+        u = U()
+        u.params = d.resolve_params(decl, None)
+        hashes.append((d.config_hash(decl.unit, decl.version, u.params), core._stamp_hash(u, decl)))
+    assert hashes[0] == hashes[1] and hashes[0][0] == hashes[0][1]
