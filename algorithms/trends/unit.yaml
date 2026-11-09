@@ -1,0 +1,35 @@
+apiVersion: openddil.io/algorithm/v1
+unit: trends
+version: "1.0.0"
+runtime: stream-parallel          # ADR-0034 execution class; the only one this runner accepts
+entrypoint: trends.py:Trends
+key: asset_id
+composition: propagating          # ADR-0034 composition typing
+inputs:
+  topic: raw-sensor-stream
+  roles:
+    - {role: record_time_ns, required: true}   # the input record's broker time: the clock for every sample and window
+    - {role: fuel_remaining}
+    - {role: consumables}
+    - {role: wear_hours}
+    - {role: wear_rul}
+    - {role: active_fault_codes}
+params:                            # every tunable constant; defaults = the old in-line path's values
+  fluid_window_min:     {type: number,  default: 15,   minimum: 0, unit: min}
+  wear_window_min:      {type: number,  default: 60,   minimum: 0, unit: min}
+  emit_every_n_samples: {type: integer, default: 5,    minimum: 1}
+  window_cap:           {type: integer, default: 4096, minimum: 2}   # samples kept per signal
+state:
+  persistence: memory              # lost on a restart, as the old in-line buffers were; trends refill from the live feed
+  fields:
+    buffers:            {type: object,  default: {}}    # signal key -> its samples
+    samples_since_emit: {type: integer, default: 0}
+outputs:
+  - kind: window                   # WindowedTelemetry on asset-telemetry-windows
+    topic: asset-telemetry-windows
+    direction: local               # local | upward; terminal + upward is refused
+    producer_id: faust-edge
+    source_protocol: openddil.trends.v1
+    labels: copy-source            # the only accepted value until ADR-0055 (high-water)
+resources: {memory_mi: 8, cpu_m: 10}   # unmeasured; a ceiling for the render check, not a measurement
+dependencies: []                   # must be empty: dependencies ship in the image, never fetched
