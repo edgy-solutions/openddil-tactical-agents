@@ -64,6 +64,10 @@ def _load_entrypoint(image, monkeypatch):
         # other tests import the runner first; a cached module is not "new" and
         # its send site would escape the scan below
         monkeypatch.delitem(sys.modules, n)
+    # an edge test's module-level import leaves the entrypoint cached; a cached
+    # module never runs app.topic under the patch below and keeps the earlier app id
+    for entry in ("faust_edge", "faust_regional"):
+        monkeypatch.delitem(sys.modules, entry, raising=False)
     before = set(sys.modules)
     topic_names = {}
     orig_topic = faust.App.topic

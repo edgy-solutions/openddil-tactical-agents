@@ -91,10 +91,10 @@ class OldTrends:
         out.asset_id = aid
         out.platform_variant = platform_variant
         out.computed_at.FromNanoseconds(now_ns)
-        # ADR-0023 Phase 6b §A.2: stamp origin-node provenance from this
+        # ADR-0023 Phase 6b Â§A.2: stamp origin-node provenance from this
         # faust-edge instance's env (faust-edge is already per-edge). The
         # projector telemetry_windows handler reads this with env-default
-        # fallback; faust-regional's region-wear-trends aggregator (§B)
+        # fallback; faust-regional's region-wear-trends aggregator (Â§B)
         # consumes it as an attributed input. Inherit producer_id/sample_time
         # from the source event when possible.
         if sample_time is not None and (sample_time.seconds or sample_time.nanos):
@@ -105,7 +105,7 @@ class OldTrends:
         out.provenance.ingest_time.FromNanoseconds(now_ns)
         out.provenance.classification = "U"
 
-        # ADR-0029 §3: PROPAGATE, do not derive. A window is a rollup of ONE
+        # ADR-0029 Â§3: PROPAGATE, do not derive. A window is a rollup of ONE
         # asset's own samples, so it inherits that asset's labels whole -- this
         # is not the aggregate case the regional aggregator handles, where rows
         # from several authors are combined and no one of them may claim
@@ -145,7 +145,7 @@ class OldTrends:
             if window_min_start is None or trend.window_start_ns < window_min_start:
                 window_min_start = trend.window_start_ns
 
-        # Consumable trends — group by slot key
+        # Consumable trends â€” group by slot key
         ammo_slots: dict[str, dict] = {}
         for key, dq in buffers.items():
             if not key.startswith("ammo:"):
@@ -166,7 +166,7 @@ class OldTrends:
                 t.capacity = cs.quantity_capacity
                 t.nsn = cs.nsn
 
-        # Wear trends — pair hours_in_service with remaining_useful_life per component
+        # Wear trends â€” pair hours_in_service with remaining_useful_life per component
         component_names = set()
         for key in buffers:
             if key.startswith("wear_hours:"):
@@ -189,13 +189,13 @@ class OldTrends:
             if r_trend is not None:
                 t.remaining_useful_life.CopyFrom(trend_to_proto(r_trend))
 
-        # Latest subsystem-fault tokens (passthrough — not aggregated)
+        # Latest subsystem-fault tokens (passthrough â€” not aggregated)
         if evt is not None and list(evt.sustainment.health.active_fault_codes):
             out.active_fault_codes_latest.extend(
                 list(evt.sustainment.health.active_fault_codes),
             )
 
-        # WindowSpec — use the widest range we covered.
+        # WindowSpec â€” use the widest range we covered.
         if window_range_ns is not None:
             start_ns, end_ns = window_range_ns
         else:
