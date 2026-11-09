@@ -257,3 +257,33 @@ def test_compare_oracle_mode_with_synth():
     envs = [(i, i, b"k", raw(envelope(t_s=i, elements=els(0.5 if i % 4 < 2 else 0.99)))) for i in range(40)]
     rep = replay.compare_oracle(unit, decl, params, iter(envs), env, "element_bands")
     assert rep.compared == rep.equal > 0 and not rep.different
+
+
+# The old tracker's own cases (they lived in edge/tests/test_element_band_event.py
+# with the tracker), run through the unit with that file's config.
+OLD_CFG = {"health": {"limits": [0.90, 0.97], "names": ["ok", "degraded", "critical"],
+                      "hysteresis": 0.02, "severity": {"ok": "info", "degraded": "warn", "critical": "crit"}}}
+
+
+def _band_path(rig, healths, field="health", element="e"):
+    """The (from, to) crossings the unit sends for a run of values."""
+    out = []
+    for i, h in enumerate(healths):
+        old, new = rig.feed(raw(envelope(t_s=i + 1, elements=[{"element_id": element, field: h}])))
+        assert old == new
+        out.extend((json.loads(v)["data"]["from"], json.loads(v)["data"]["to"]) for _t, _k, v in new)
+    return out
+
+
+def test_schmitt_behaviour_through_the_unit():
+    rig = Rig({"bands": OLD_CFG})
+    got = _band_path(rig, [0.50, 0.91, 0.89, 0.905, 0.87, 0.99, 0.96, 0.20])
+    assert got == [("ok", "degraded"), ("degraded", "ok"), ("ok", "critical"), ("critical", "ok")]
+
+
+def test_ignored_inputs_through_the_unit():
+    rig = Rig({"bands": OLD_CFG})
+    assert _band_path(rig, ["bad", True]) == []
+    assert _band_path(rig, [99.0], field="temp_c") == []
+    # ignored values did not set a band: the next numeric is still the first observation
+    assert _band_path(rig, [0.99]) == []

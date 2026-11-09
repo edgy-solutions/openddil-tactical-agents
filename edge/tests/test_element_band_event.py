@@ -1,7 +1,7 @@
 """
 Tests for element band events: the event builder (edge/element_band_event.py),
-the Schmitt-trigger tracker (edge/element_bands.py) and the faust_edge
-element-path wiring. No broker: the agent's coroutine is driven with a fake
+and the faust_edge element path (which no longer
+sends band events: the element_bands unit does, see tests/test_element_bands_equivalence.py). No broker: the agent's coroutine is driven with a fake
 stream and fake topics.
 
 Run with: py -3 -m pytest edge/tests/test_element_band_event.py -q
@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import logging
 import sys
 from pathlib import Path
 
@@ -20,19 +19,8 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from element_band_event import EVENT_TYPE, build_band_event  # noqa: E402
-from element_bands import BandTracker, parse_config  # noqa: E402
 
 GOLDEN_ID = "eb39f2b1-78f8-5ec7-88fa-c6cacc881f38"
-CFG = {
-    "health": {
-        "limits": [0.90, 0.97],
-        "names": ["ok", "degraded", "critical"],
-        "hysteresis": 0.02,
-        "severity": {"ok": "info", "degraded": "warn", "critical": "crit"},
-    }
-}
-
-
 def _ev(nation="", rel=(), frm="ok", to="degraded"):
     return build_band_event("asset-1", "el-7", "psu", "health", frm, to,
                             0.93, 100.0, "warn", nation, rel, "edge-01", "region-01")
@@ -71,53 +59,6 @@ def test_same_band_raises():
         _ev(frm="ok", to="ok")
 
 
-def test_schmitt_behaviour():
-    t = BandTracker(CFG)
-    k = ("a", "e", "health")
-    assert t.update(*k, 0.50) is None          # first observation: no crossing
-    assert t.update(*k, 0.91) == ("ok", "degraded")
-    assert t.update(*k, 0.89) is None          # inside hysteresis (>= 0.88)
-    assert t.update(*k, 0.905) is None
-    assert t.update(*k, 0.87) == ("degraded", "ok")
-    assert t.update(*k, 0.99) == ("ok", "critical")   # multi-band jump, one transition
-    assert t.update(*k, 0.96) is None
-    assert t.update(*k, 0.20) == ("critical", "ok")   # multi-band fall, one transition
-
-
-def test_ignored_inputs():
-    t = BandTracker(CFG)
-    assert t.update("a", "e", "health", "bad") is None
-    assert t.update("a", "e", "health", True) is None
-    assert t.update("a", "e", "temp_c", 99.0) is None
-    # ignored values did not set a band: next numeric is still the first observation
-    assert t.update("a", "e", "health", 0.99) is None
-
-
-def _cfg(**over):
-    c = json.loads(json.dumps(CFG["health"]))
-    c.update(over)
-    return json.dumps({"health": c})
-
-
-def test_parse_config_ok():
-    assert parse_config(_cfg())["health"]["limits"] == [0.90, 0.97]
-
-
-@pytest.mark.parametrize("text", [
-    "not json", "[]", "{}",
-    _cfg(names=["ok", "degraded"]),
-    _cfg(limits=[0.97, 0.90]),
-    _cfg(limits=[0.9, 0.9]),
-    _cfg(hysteresis=-0.1),
-    _cfg(hysteresis="x"),
-    _cfg(severity={"ok": "info", "degraded": "warn"}),
-    _cfg(severity={"ok": "info", "degraded": "warn", "critical": ""}),
-])
-def test_parse_config_rejects(text):
-    with pytest.raises(ValueError):
-        parse_config(text)
-
-
 # Wiring: drive the real `process_elements` agent body with fake topics.
 class _Fake:
     def __init__(self):
@@ -127,7 +68,7 @@ class _Fake:
         self.sent.append((key, value))
 
 
-def _run(envs, *, config):
+def _run(envs):
     import faust_edge
     ev_t, win_t = _Fake(), _Fake()
 
@@ -139,12 +80,10 @@ def _run(envs, *, config):
     try:
         mp.setattr(faust_edge, "events_topic", ev_t)
         mp.setattr(faust_edge, "windows_topic", win_t)
-        mp.setattr(faust_edge, "band_config", config)
-        mp.setattr(faust_edge, "band_tracker", BandTracker(config) if config else None)
         asyncio.run(faust_edge.process_elements.fun(stream()))
     finally:
         mp.undo()
-    return [json.loads(v) for _, v in ev_t.sent], ev_t, win_t
+    return ev_t, win_t
 
 
 def _env(t_s, health):
@@ -156,36 +95,7 @@ def _env(t_s, health):
     }
 
 
-def test_wiring_off_without_config():
-    sent, ev_t, win_t = _run([_env(1, 0.5), _env(2, 0.99)], config=None)
-    assert sent == [] and ev_t.sent == []
-    assert len(win_t.sent) == 2        # the rollup path is untouched
-
-
-@pytest.mark.parametrize("text", ["", "   "])
-def test_off_logs_exactly_one_line(caplog, text):
-    import faust_edge
-    with caplog.at_level(logging.INFO):
-        assert faust_edge.load_band_config(text) is None
-    lines = [r for r in caplog.records if "band events are off" in r.getMessage()]
-    assert len(lines) == 1
-
-
-def test_invalid_config_fails_at_start():
-    import faust_edge
-    with pytest.raises(ValueError):
-        faust_edge.load_band_config('{"health": 1}')
-    assert faust_edge.load_band_config(_cfg())["health"]["hysteresis"] == 0.02
-
-
-def test_wiring_one_event_from_two_envelopes():
-    sent, ev_t, _ = _run([_env(1, 0.5), _env(2, 0.99)], config=CFG)
-    assert len(sent) == 1
-    ev = sent[0]
-    assert ev_t.sent[0][0] == "a1"
-    assert ev["type"] == EVENT_TYPE
-    d = ev["data"]
-    assert (d["from"], d["to"], d["severity"]) == ("ok", "critical", "crit")
-    assert d["element_path"] == "e1" and d["layer_name"] == "psu"
-    assert d["originator_nation"] == "ATL" and d["releasable_to"] == ["BDR"]
-    assert ev["time"] == "1970-01-01T00:00:02.000000+00:00"
+def test_element_path_sends_windows_and_no_band_events():
+    ev_t, win_t = _run([_env(1, 0.5), _env(2, 0.99)])
+    assert ev_t.sent == []              # crossings come from the element_bands unit
+    assert len(win_t.sent) == 2         # the rollup path is untouched
