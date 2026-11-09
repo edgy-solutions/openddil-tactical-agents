@@ -1,5 +1,5 @@
 """
-Unit tests for edge/posture.py's step() (ADR-0044 amendment, "posture, a
+Unit tests for the posture unit's step() (algorithms/posture/posture_unit.py) (ADR-0044 amendment, "posture, a
 third column") -- the amendment's transition table, both negative cases, and
 a replay of the fixture schedule reproducing its predicted transitions
 exactly.
@@ -15,8 +15,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-import posture  # noqa: E402
-from posture import COLD_START, PostureState, Thresholds, step  # noqa: E402
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "algorithms" / "posture"))
+
+import posture_unit as posture  # noqa: E402
+from posture_unit import COLD_START, PostureState, Thresholds, step  # noqa: E402
 
 DEFAULTS = Thresholds(move_speed_mps=1.0, move_hold_s=10.0, stop_hold_s=20.0)
 

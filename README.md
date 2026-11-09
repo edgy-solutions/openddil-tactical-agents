@@ -61,7 +61,7 @@ been there the whole time; adding the second Table just made it visible.
   (`rpk topic delete openddil-edge-<table-name>-changelog`) so Faust
   recreates it with the new count.
 
-Both current Tables (`asset_state` in `edge/faust_edge.py` and
+Both current Tables (`asset_state`, declared in `algorithms/posture/unit.yaml`, and
 `prognostics_accumulators`, declared in `algorithms/wear/unit.yaml` and built by `edge/algorithm_runtime/runner.py`) point back to
 this section in their inline comments.
 

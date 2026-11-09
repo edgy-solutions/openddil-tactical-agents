@@ -4,7 +4,7 @@
 state table and one agent on its input topic. The agent is separate from
 faust_edge.py's own agents: its own consumer, its own table, its own output
 topic. That separation is the input/output seam (ADR-0020): a unit does not
-reach into faust-edge's window buffers or `asset_state` table, and
+reach into faust-edge's element buffers, and
 faust-edge does not see a unit's state. The call in faust_edge.py is the only
 coupling; to extract the runner into its own service, delete that import and
 call and give the new service its own `faust.App`.

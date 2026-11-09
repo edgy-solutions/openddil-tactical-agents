@@ -1,7 +1,7 @@
 """
 Tests for the per-variant deployment signal feeding the posture state
-machine: faust_edge._posture_inputs picks launcher_raised (launcher variants)
-or emitting (sensor variants), and posture.step treats either as the
+machine: the host's deploy_signal / speed_mps / sample_time_s roles pick
+launcher_raised (launcher variants) or emitting (sensor variants), and posture.step treats either as the
 deployment signal.
 
 No broker; the Faust app object is constructed but never started.
@@ -16,11 +16,20 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-import faust_edge  # noqa: E402
-import posture as posture_mod  # noqa: E402
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "algorithms" / "posture"))
+
+import posture_unit as posture_mod  # noqa: E402
+from algorithm_runtime import roles  # noqa: E402
 from openddil.telemetry.v1 import telemetry_pb2 as pb  # noqa: E402
 
-TH = faust_edge.POSTURE_THRESHOLDS
+# The old POSTURE_* env defaults (the unit's declared param defaults).
+TH = posture_mod.Thresholds(move_speed_mps=1.0, move_hold_s=10.0, stop_hold_s=20.0)
+
+
+def _posture_inputs(evt):
+    """(deploy_signal, speed, now) as the unit's three roles carry them."""
+    got = roles.extract(evt, {"deploy_signal", "speed_mps", "sample_time_s"})
+    return got["deploy_signal"], got["speed_mps"], got["sample_time_s"]
 
 
 def _evt(*, launcher=None, emitting=None, speed=None, t=0.0):
@@ -39,7 +48,7 @@ def _run(seq, state=posture_mod.COLD_START):
     """seq: (t, kwargs) -> list of postures after each tick."""
     out = []
     for t, kw in seq:
-        sig, speed, now = faust_edge._posture_inputs(_evt(t=t, **kw))
+        sig, speed, now = _posture_inputs(_evt(t=t, **kw))
         state = posture_mod.step(state, sig, speed, now, TH)
         out.append(state.posture)
     return out
@@ -47,20 +56,20 @@ def _run(seq, state=posture_mod.COLD_START):
 
 # (a) input selection
 def test_inputs_emitting_true():
-    assert faust_edge._posture_inputs(_evt(emitting=True))[0] is True
+    assert _posture_inputs(_evt(emitting=True))[0] is True
 
 
 def test_inputs_emitting_false_is_honoured():
-    assert faust_edge._posture_inputs(_evt(emitting=False))[0] is False
+    assert _posture_inputs(_evt(emitting=False))[0] is False
 
 
 def test_inputs_neither_field_is_none():
-    assert faust_edge._posture_inputs(_evt())[0] is None
+    assert _posture_inputs(_evt())[0] is None
 
 
 def test_inputs_launcher_raised_value_passes_through():
-    assert faust_edge._posture_inputs(_evt(launcher=True))[0] is True
-    assert faust_edge._posture_inputs(_evt(launcher=False))[0] is False
+    assert _posture_inputs(_evt(launcher=True))[0] is True
+    assert _posture_inputs(_evt(launcher=False))[0] is False
 
 
 # (b) sensor sequence
