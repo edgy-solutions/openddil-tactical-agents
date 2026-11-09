@@ -47,3 +47,23 @@ def make_thermal(overrides=None):
     sys.modules[name] = module
     spec.loader.exec_module(module)
     return module.ThermalRunaway(declaration.resolve_params(decl, overrides)), decl
+
+
+POSTURE_DIR = ROOT / "algorithms" / "posture"
+
+
+def posture_decl() -> declaration.Declaration:
+    return declaration.load(POSTURE_DIR / "unit.yaml")
+
+
+def make_posture(overrides=None):
+    """(unit, decl) for the posture unit, loaded by file under the guard as
+    the runner does, with `overrides` applied to its declared defaults."""
+    decl = posture_decl()
+    guard.check_unit_dir(POSTURE_DIR)
+    name = "openddil_algorithms.posture"
+    spec = importlib.util.spec_from_file_location(name, POSTURE_DIR / "posture_unit.py")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module.Posture(declaration.resolve_params(decl, overrides)), decl

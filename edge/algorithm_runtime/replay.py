@@ -781,6 +781,12 @@ def _stamp_of(msg):
     return (ps.unit, ps.version, ps.config_hash, ps.tier)
 
 
+def _wire(msg):
+    """An unstamped kind as it goes on the wire: bytes as they are, a CloudEvent
+    dict through one JSON round trip (the encoding the send does)."""
+    return json.loads(json.dumps(msg)) if isinstance(msg, dict) else msg
+
+
 def _diff_any(a, b) -> list[str]:
     if isinstance(a, (bytes, bytearray)) or isinstance(b, (bytes, bytearray)):
         # An unstamped kind's bytes: name the proto paths when both parse as
@@ -862,7 +868,7 @@ def compare_oracle(unit, decl, params, raw_records, env, name: str, synth_seed: 
                 if key[1] in unstamped:
                     # Compared exactly: raw bytes, or the parsed JSON of a
                     # transition. No clearing of id or time, no normalizing.
-                    a, b = o_msg, n_msg
+                    a, b = _wire(o_msg), _wire(n_msg)
                 else:
                     a, b = normalize(key[1], _norm_out(o_msg)), normalize(key[1], _norm_out(n_msg))
                 if a == b:
