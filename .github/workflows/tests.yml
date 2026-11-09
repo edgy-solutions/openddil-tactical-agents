@@ -55,6 +55,15 @@ jobs:
         run: |
           pip install jsonschema
           python -m pytest -q tests
+      # edge/tests import faust_edge, which registers the enabled units, so the
+      # runner's three variables are set here as the deployment sets them.
+      - name: edge suite
+        env:
+          PYTHONPATH: ${{ github.workspace }}/openddil-contracts/gen/python
+          OPENDDIL_EDGE_ID: edge-test
+          ALGORITHMS_ENABLED: wear,thermal,trends
+          ALGORITHMS_DIR: ${{ github.workspace }}/algorithms
+        run: python -m pytest -q edge/tests
       # The offline replay harness, on synthetic recordings with the frozen
       # oracle playing production (includes the 200k-record memory bound).
       - name: replay harness
