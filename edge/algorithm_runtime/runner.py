@@ -18,6 +18,7 @@ from __future__ import annotations
 import copy
 import json
 import logging
+import math
 import os
 from pathlib import Path
 
@@ -68,6 +69,44 @@ def _refuse_legacy_env() -> None:
             f'set {{"{unit}": {{"{param}": <value>}}}} and unset {k} '
             f"(all set: {', '.join(old)})"
         )
+
+
+def _limit(name: str) -> float:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        raise StartupRefusal(
+            f"{name} is unset: the runner checks the enabled units' declared resources against the "
+            "pod's limit, which the chart passes through the downward API")
+    try:
+        value = float(raw)
+    except ValueError:
+        value = float("nan")
+    if not math.isfinite(value):
+        raise StartupRefusal(f"{name}={raw!r} is not a number: set it to the pod's limit")
+    return value
+
+
+def _refuse_unrunnable(loaded: list) -> None:
+    """The enabled units must carry a measurement and fit the pod.
+
+    A unit declares what it needs as a measured value (`measured`, and
+    `resources` taken from it); the runner refuses to start units whose
+    declared sum it cannot honour. Not a unit rule: the replay harness does not
+    apply it."""
+    unmeasured = [decl.unit for decl, _unit, _params in loaded if decl.measured is None]
+    if unmeasured:
+        raise StartupRefusal(
+            f"unit {unmeasured[0]!r} has no measured block (without one: {', '.join(unmeasured)}): "
+            "run replay --measure over the recording and write the block into its unit.yaml")
+    for var, field_, label in (("ALGORITHMS_MEMORY_LIMIT_MI", "memory_mi", "memory"),
+                               ("ALGORITHMS_CPU_LIMIT_M", "cpu_m", "CPU")):
+        limit = _limit(var)
+        total = sum(getattr(decl, field_) for decl, _unit, _params in loaded)
+        if total > limit:
+            per_unit = ", ".join(f"{decl.unit}={getattr(decl, field_)}" for decl, _unit, _params in loaded)
+            raise StartupRefusal(
+                f"the enabled units declare resources.{field_} summing to {total:g} ({per_unit}), above "
+                f"{var}={limit:g}: enable fewer units, or raise the pod's {label} limit")
 
 
 def make_record_class(decl: declaration.Declaration) -> type:
@@ -237,6 +276,8 @@ def register(app: faust.App, window_rollup=None) -> Runner:
         params = declaration.resolve_params(decl, params_json.get(name))
         unit = loader.load_unit_class(unit_dir, decl, StartupRefusal)(params)
         loaded.append((decl, unit, params))
+
+    _refuse_unrunnable(loaded)
 
     runner = Runner()
     for decl, unit, params in loaded:

@@ -357,6 +357,8 @@ def renv(monkeypatch, tmp_path):
     monkeypatch.setenv("ALGORITHMS_ENABLED", "trends")
     monkeypatch.setenv("OPENDDIL_EDGE_ID", "edge-tst")
     monkeypatch.setenv("OPENDDIL_REGION_ID", "region-tst")
+    monkeypatch.setenv("ALGORITHMS_MEMORY_LIMIT_MI", "1024")
+    monkeypatch.setenv("ALGORITHMS_CPU_LIMIT_M", "1000")
     return monkeypatch
 
 

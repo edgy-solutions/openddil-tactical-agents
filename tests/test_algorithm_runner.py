@@ -12,6 +12,7 @@ import types
 
 import faust
 import pytest
+import yaml
 
 from algorithm_runtime import runner
 from unit_helpers import ROOT, WEAR_DIR, thermal_decl, wear_decl
@@ -42,6 +43,8 @@ def env(monkeypatch, algorithms_dir):
     monkeypatch.setenv("ALGORITHMS_DIR", str(algorithms_dir))
     monkeypatch.setenv("ALGORITHMS_ENABLED", "wear")
     monkeypatch.setenv("OPENDDIL_EDGE_ID", "edge-tst")
+    monkeypatch.setenv("ALGORITHMS_MEMORY_LIMIT_MI", "1024")
+    monkeypatch.setenv("ALGORITHMS_CPU_LIMIT_M", "1000")
     return monkeypatch
 
 
@@ -210,3 +213,67 @@ def test_generated_class_fields_follow_the_declaration_in_order():
     cls = runner.make_record_class(decl)
     assert list(json.loads(cls().dumps()))[:-1] == [f.name for f in decl.state_fields]
     assert cls().last_ecef_x is None and cls().cumulative_distance_m == 0.0
+
+
+# --- the runner refuses what it cannot honour ----------------------------------
+def _repo_sums(units):
+    from algorithm_runtime import declaration
+    decls = [declaration.load(ROOT / "algorithms" / u / "unit.yaml") for u in units]
+    return sum(d.memory_mi for d in decls), sum(d.cpu_m for d in decls)
+
+
+def test_refuses_a_unit_with_no_measured_block_and_names_it(env, algorithms_dir):
+    path = algorithms_dir / "wear" / "unit.yaml"
+    doc = yaml.safe_load(path.read_text(encoding="utf-8"))
+    assert doc.pop("measured")
+    path.write_text(yaml.safe_dump(doc), encoding="utf-8")
+    with refuse("'wear' has no measured block"):
+        runner.register(new_app())
+
+
+@pytest.mark.parametrize("var", ["ALGORITHMS_MEMORY_LIMIT_MI", "ALGORITHMS_CPU_LIMIT_M"])
+@pytest.mark.parametrize("value", [None, "", "lots", "nan", "inf"])
+def test_refuses_a_limit_that_is_unset_or_not_a_number_and_names_the_variable(env, var, value):
+    if value is None:
+        env.delenv(var)
+    else:
+        env.setenv(var, value)
+    with refuse(var):
+        runner.register(new_app())
+
+
+def test_refuses_when_the_declared_memory_sums_above_the_limit(env):
+    env.setenv("ALGORITHMS_DIR", str(ROOT / "algorithms"))
+    env.setenv("ALGORITHMS_ENABLED", "wear,thermal")
+    mem, _cpu = _repo_sums(["wear", "thermal"])
+    env.setenv("ALGORITHMS_MEMORY_LIMIT_MI", str(mem - 1))
+    with refuse(rf"memory_mi summing to {mem}.*wear.*thermal.*ALGORITHMS_MEMORY_LIMIT_MI={mem - 1}"):
+        runner.register(new_app())
+
+
+def test_refuses_when_the_declared_cpu_sums_above_the_limit(env):
+    env.setenv("ALGORITHMS_DIR", str(ROOT / "algorithms"))
+    env.setenv("ALGORITHMS_ENABLED", "wear,thermal")
+    _mem, cpu = _repo_sums(["wear", "thermal"])
+    env.setenv("ALGORITHMS_CPU_LIMIT_M", str(cpu - 1))
+    with refuse(rf"cpu_m summing to {cpu}.*wear.*thermal.*ALGORITHMS_CPU_LIMIT_M={cpu - 1}"):
+        runner.register(new_app())
+
+
+def test_a_sum_exactly_at_both_limits_registers(env):
+    env.setenv("ALGORITHMS_DIR", str(ROOT / "algorithms"))
+    env.setenv("ALGORITHMS_ENABLED", "wear,thermal")
+    mem, cpu = _repo_sums(["wear", "thermal"])
+    env.setenv("ALGORITHMS_MEMORY_LIMIT_MI", str(mem))
+    env.setenv("ALGORITHMS_CPU_LIMIT_M", str(cpu))
+    app = new_app()
+    runner.register(app)
+    assert len(app.agents) == 2
+
+
+def test_the_limit_refusals_are_raised_before_any_agent_is_wired(env):
+    env.setenv("ALGORITHMS_MEMORY_LIMIT_MI", "0")
+    app = new_app()
+    with refuse("ALGORITHMS_MEMORY_LIMIT_MI"):
+        runner.register(app)
+    assert len(app.agents) == 0 and not app.tables
