@@ -46,6 +46,13 @@ ROLES: dict[str, str] = {
     "wear_hours": "dict[str, tuple[float, str]]",
     "wear_rul": "dict[str, tuple[float, str]]",
     "active_fault_codes": "tuple[str, ...]",
+    # Posture inputs, always present when named; None means absent. The
+    # deployment signal is the variant's own (launcher_raised, else emitting);
+    # the speed is |ecef velocity| in m/s; the time is the record's own
+    # provenance.sample_time as seconds.
+    "deploy_signal": "bool | None",
+    "speed_mps": "float | None",
+    "sample_time_s": "float",
 }
 
 

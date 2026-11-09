@@ -30,7 +30,15 @@ API_VERSION = "openddil.io/algorithm/v1"
 RUNTIME = "stream-parallel"
 LABELS = "copy-source"
 # Output kind table. Each kind maps to an envelope field in outputs.py.
-OUTPUT_KINDS = ("sustainment", "anomaly", "window")
+OUTPUT_KINDS = ("sustainment", "anomaly", "window", "latest_state", "posture_transition")
+# Output class. A `value` output is whatever the unit returns; a `transition`
+# output is one record per change of the named state field, and the host
+# drops the payload of a step in which that field did not change.
+OUTPUT_CLASSES = ("value", "transition")
+# Producer stamp. `none` is for the kinds whose bytes or shape must stay what
+# they were before the unit existed (so they carry no producer fields either).
+STAMPS = ("producer", "none")
+UNSTAMPED_KINDS = ("latest_state", "posture_transition")
 # An anomaly output names the CloudEvent type it emits and the severity the
 # contract stamps on it; the unit supplies neither.
 EVENT_TYPE = re.compile(r"^openddil\.anomaly\.[a-z0-9_.]+$")
@@ -41,7 +49,10 @@ PARAM_TYPES = ("number", "integer")
 # `memory` is a per-process dict, lost on a restart, for state a unit may
 # rebuild from the live feed. Only memory state may hold an `object` field.
 PERSISTENCES = ("durable", "memory")
-STATE_FIELD_TYPES = PARAM_TYPES + ("object",)
+# `string` may be stored (a durable record field); `object` and `boolean` only
+# in memory.
+STATE_FIELD_TYPES = PARAM_TYPES + ("string", "object", "boolean")
+DURABLE_FIELD_TYPES = PARAM_TYPES + ("string",)
 
 _TOP_KEYS = {
     "apiVersion", "unit", "version", "runtime", "entrypoint", "key",
@@ -69,8 +80,9 @@ class Param:
 class StateField:
     name: str
     type: str
-    default: int | float | dict | None
+    default: int | float | str | bool | dict | None
     nullable: bool = False
+    persistence: str = "durable"     # effective: "memory" for a field of a memory unit
 
 
 @dataclass(frozen=True)
@@ -84,11 +96,14 @@ class OutputDecl:
     kind: str
     topic: str
     direction: str
-    producer_id: str
-    source_protocol: str
-    labels: str
+    producer_id: str = ""            # absent (empty) under stamp: none
+    source_protocol: str = ""
+    labels: str = LABELS
     event_type: str | None = None    # anomaly outputs only
     severity: str | None = None      # anomaly outputs only
+    output_class: str = "value"      # YAML key `class`
+    on_change_of: str | None = None  # transition outputs only: a declared state field
+    stamp: str = "producer"
 
 
 @dataclass(frozen=True)
@@ -239,14 +254,27 @@ def validate(raw: Any) -> Declaration:
     fields = []
     for name, f in st["fields"].items():
         w = f"state.fields.{name}"
-        f = _mapping(f, w, {"type", "default", "nullable"}, {"type", "default"})
-        allowed = STATE_FIELD_TYPES if persistence == "memory" else PARAM_TYPES
+        f = _mapping(f, w, {"type", "default", "nullable", "persistence"}, {"type", "default"})
+        field_persistence = f.get("persistence", persistence)
+        if field_persistence not in PERSISTENCES:
+            raise DeclarationError(
+                f"{w}.persistence: {field_persistence!r} is not one of {list(PERSISTENCES)}")
+        if persistence == "memory" and field_persistence != "memory":
+            raise DeclarationError(f"{w}.persistence: a memory-persistence unit has no durable field")
+        allowed = STATE_FIELD_TYPES if field_persistence == "memory" else DURABLE_FIELD_TYPES
         if f["type"] not in allowed:
             raise DeclarationError(f"{w}.type: {f['type']!r} is not one of {list(allowed)}")
         nullable = f.get("nullable", False)
         if not isinstance(nullable, bool):
             raise DeclarationError(f"{w}.nullable: must be a boolean")
-        if f["type"] == "object":
+        if f["type"] in ("string", "boolean"):
+            if nullable:
+                raise DeclarationError(f"{w}.nullable: a {f['type']} field is never null")
+            want = str if f["type"] == "string" else bool
+            if not isinstance(f["default"], want):
+                raise DeclarationError(f"{w}.default: {f['default']!r} is not a {f['type']}")
+            default = f["default"]
+        elif f["type"] == "object":
             if nullable:
                 raise DeclarationError(f"{w}.nullable: an object field is never null")
             if not isinstance(f["default"], dict):
@@ -258,19 +286,47 @@ def validate(raw: Any) -> Declaration:
             default = None
         else:
             default = _coerce(f["default"], f["type"], f"{w}.default")
-        fields.append(StateField(name, f["type"], default, nullable))
+        fields.append(StateField(name, f["type"], default, nullable, field_persistence))
+    if persistence == "durable" and all(f.persistence == "memory" for f in fields):
+        raise DeclarationError("state.fields: a durable unit needs at least one durable field")
 
     outs = []
     if not isinstance(d["outputs"], list) or not d["outputs"]:
         raise DeclarationError("outputs: must be a non-empty list")
-    keys = {"kind", "topic", "direction", "producer_id", "source_protocol", "labels"}
+    keys = {"kind", "topic", "direction", "labels"}
+    producer_keys = {"producer_id", "source_protocol"}
+    class_keys = {"class", "on_change_of", "stamp"}
     anomaly_keys = {"event_type", "severity"}
+    state_names = {f.name for f in fields}
     for i, o in enumerate(d["outputs"]):
         w = f"outputs[{i}]"
-        o = _mapping(o, w, keys | anomaly_keys, keys)
+        o = _mapping(o, w, keys | producer_keys | class_keys | anomaly_keys, keys)
         if o["kind"] not in OUTPUT_KINDS:
             raise DeclarationError(
                 f"{w}.kind: {o['kind']!r} is not in the kind table {list(OUTPUT_KINDS)}")
+        stamp = o.get("stamp", "producer")
+        if stamp not in STAMPS:
+            raise DeclarationError(f"{w}.stamp: {stamp!r} is not one of {list(STAMPS)}")
+        if (stamp == "none") != (o["kind"] in UNSTAMPED_KINDS):
+            raise DeclarationError(
+                f"{w}.stamp: 'none' is for the kinds {list(UNSTAMPED_KINDS)}, and only for them")
+        for k in sorted(producer_keys):
+            if stamp == "none" and k in o:
+                raise DeclarationError(f"{w}.{k}: an output with stamp: none carries no producer fields")
+            if stamp != "none" and k not in o:
+                raise DeclarationError(f"{w}: missing key {k!r}")
+        klass = o.get("class", "value")
+        if klass not in OUTPUT_CLASSES:
+            raise DeclarationError(f"{w}.class: {klass!r} is not one of {list(OUTPUT_CLASSES)}")
+        on_change = o.get("on_change_of")
+        if klass == "transition":
+            if on_change is None:
+                raise DeclarationError(f"{w}: missing key 'on_change_of', which a transition output needs")
+            if on_change not in state_names:
+                raise DeclarationError(
+                    f"{w}.on_change_of: {on_change!r} is not a declared state field {sorted(state_names)}")
+        elif on_change is not None:
+            raise DeclarationError(f"{w}.on_change_of: only a transition output carries it")
         event_type = severity = None
         if o["kind"] == "anomaly":
             for k in sorted(anomaly_keys):
@@ -296,9 +352,9 @@ def validate(raw: Any) -> Declaration:
                 f"{w}.labels: {o['labels']!r} is not {LABELS!r}, the only accepted value")
         outs.append(OutputDecl(
             o["kind"], _string(o["topic"], f"{w}.topic"), o["direction"],
-            _string(o["producer_id"], f"{w}.producer_id"),
-            _string(o["source_protocol"], f"{w}.source_protocol"), o["labels"],
-            event_type, severity,
+            _string(o["producer_id"], f"{w}.producer_id") if stamp != "none" else "",
+            _string(o["source_protocol"], f"{w}.source_protocol") if stamp != "none" else "",
+            o["labels"], event_type, severity, klass, on_change, stamp,
         ))
 
     res = _mapping(d["resources"], "resources", {"memory_mi", "cpu_m"}, {"memory_mi", "cpu_m"})

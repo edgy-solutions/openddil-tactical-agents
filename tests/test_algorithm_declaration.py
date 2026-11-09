@@ -51,7 +51,7 @@ REFUSALS = [
     ("apiVersion", _set(["apiVersion"], "openddil.io/algorithm/v2"), "apiVersion", True),
     ("runtime", _set(["runtime"], "durable-workflow"), "runtime", True),
     ("labels", _set(["outputs", 0, "labels"], "high-water"), "labels", True),
-    ("unknown role", _set(["inputs", "roles", 0, "role"], "speed_mps"), "role", True),
+    ("unknown role", _set(["inputs", "roles", 0, "role"], "airspeed_mps"), "role", True),
     ("missing default", _del(["params", "critical_fraction", "default"]), "default", True),
     ("default of the wrong type (string)", _set(["params", "critical_fraction", "default"], "1.0"),
      "critical_fraction.default", True),

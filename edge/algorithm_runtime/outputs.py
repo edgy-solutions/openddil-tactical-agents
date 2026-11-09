@@ -34,6 +34,7 @@ import os
 import time
 import uuid
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from typing import Mapping
 
 from google.protobuf import json_format
@@ -41,10 +42,53 @@ from openddil.logistics.v1 import windowed_telemetry_pb2 as winpb
 from openddil.telemetry.v1 import telemetry_pb2 as pb
 
 from algorithm_runtime.declaration import OutputDecl
+from posture_event import build_transition_event
 
 
 class OutputError(ValueError):
     pass
+
+
+# The posture unit's lower-case state names <-> the proto enum. Lower-case
+# without prefix is also the projector's on-disk representation
+# (telemetry_latest.py), so this mapping and that one must be kept in agreement.
+_POSTURE_TO_PROTO = {
+    "unspecified":   pb.POSTURE_STATUS_UNSPECIFIED,
+    "emplaced":      pb.POSTURE_STATUS_EMPLACED,
+    "march_ordered": pb.POSTURE_STATUS_MARCH_ORDERED,
+    "moving":        pb.POSTURE_STATUS_MOVING,
+    "emplacing":     pb.POSTURE_STATUS_EMPLACING,
+}
+_POSTURE_FIELDS = ("posture", "posture_since", "motion", "motion_since")
+
+
+def _latest_state_payload(payload: Mapping) -> dict:
+    """`{"untouched": True}` (send the input bytes as they came) or
+    `{"posture": name, "posture_since": float | None}`."""
+    if isinstance(payload, Mapping) and dict(payload) == {"untouched": True}:
+        return {"untouched": True}
+    if not isinstance(payload, Mapping) or set(payload) != {"posture", "posture_since"}:
+        raise OutputError(
+            'latest_state payload must be {"untouched": True} or {"posture": ..., "posture_since": ...}')
+    posture, since = payload["posture"], payload["posture_since"]
+    if posture not in _POSTURE_TO_PROTO:
+        raise OutputError(f"latest_state posture {posture!r} is not one of {sorted(_POSTURE_TO_PROTO)}")
+    if posture != "unspecified" and not _is_number(since):
+        raise OutputError("latest_state posture_since must be a number unless the posture is unspecified")
+    return {"posture": posture, "posture_since": since}
+
+
+def _posture_dict(v, where: str) -> dict:
+    if not isinstance(v, Mapping) or set(v) != set(_POSTURE_FIELDS):
+        raise OutputError(f"posture_transition {where} must hold exactly {list(_POSTURE_FIELDS)}")
+    return dict(v)
+
+
+def _transition_payload(payload: Mapping) -> dict:
+    if not isinstance(payload, Mapping) or set(payload) != {"prev", "new", "deploy_signal", "speed"}:
+        raise OutputError("posture_transition payload must carry exactly prev, new, deploy_signal and speed")
+    return {"prev": _posture_dict(payload["prev"], "prev"), "new": _posture_dict(payload["new"], "new"),
+            "deploy_signal": payload["deploy_signal"], "speed": payload["speed"]}
 
 
 def _is_number(v) -> bool:
@@ -127,6 +171,10 @@ def build_payload(kind: str, payload: Mapping) -> pb.SustainmentMetrics | winpb.
         return _anomaly_payload(payload)
     if kind == "window":
         return _window_payload(payload)
+    if kind == "latest_state":
+        return _latest_state_payload(payload)
+    if kind == "posture_transition":
+        return _transition_payload(payload)
     if kind != "sustainment":
         raise OutputError(f"unknown output kind {kind!r}")
     if "value_provenance" in payload:
@@ -150,6 +198,8 @@ def encode(msg) -> bytes:
     CloudEvent dict is JSON."""
     if isinstance(msg, dict):
         return json.dumps(msg).encode("utf-8")
+    if isinstance(msg, bytes):
+        return msg
     return msg.SerializeToString()
 
 
@@ -163,11 +213,16 @@ def build_event(
     config_hash: str,
     tier: str,
     rollup: winpb.ElementRollup | None = None,
-) -> pb.EntityTelemetryEvent | winpb.WindowedTelemetry | dict:
+    raw: bytes | None = None,
+) -> pb.EntityTelemetryEvent | winpb.WindowedTelemetry | dict | bytes:
     """Build the output envelope. A sustainment output is a fresh EntityTelemetryEvent carrying only
     the derived sustainment + identity + provenance. No kinematics are
     echoed; consumers correlate by asset_id with the input stream. An anomaly
     output is a CloudEvent dict (see `_anomaly_event`)."""
+    if out.kind == "latest_state":
+        return _latest_state_event(src, sustainment, raw)
+    if out.kind == "posture_transition":
+        return _transition_event(src, sustainment, tier)
     if out.kind == "anomaly":
         return _anomaly_event(src, sustainment, out, unit=unit, version=version,
                               config_hash=config_hash, tier=tier)
@@ -237,6 +292,35 @@ def build_event(
     evt.provenance.producer_stamp.config_hash = config_hash
     evt.provenance.producer_stamp.tier = tier
     return evt
+
+
+def _latest_state_event(src: pb.EntityTelemetryEvent, payload: dict, raw: bytes | None) -> bytes:
+    """No producer stamp: the bytes are what the old path sent. Untouched is the
+    input bytes as they arrived; otherwise the posture fields are set on the
+    parsed event (`src`, in place, as the old agent did) and it is re-serialized."""
+    if payload.get("untouched"):
+        if raw is None:
+            raise OutputError("latest_state untouched needs the raw input bytes")
+        return raw
+    if payload["posture"] == "unspecified":
+        src.operational_state.ClearField("posture_since")
+    else:
+        src.operational_state.posture_since.FromNanoseconds(int(round(payload["posture_since"] * 1e9)))
+    src.operational_state.posture_status = _POSTURE_TO_PROTO[payload["posture"]]
+    return src.SerializeToString()
+
+
+def _transition_event(src: pb.EntityTelemetryEvent, payload: dict, tier: str) -> dict:
+    """The posture transition CloudEvent, unchanged (no producer stamp): its
+    labels are copied from the source record, absent stays absent."""
+    try:
+        return build_transition_event(
+            src.asset.asset_id, SimpleNamespace(**payload["prev"]), SimpleNamespace(**payload["new"]),
+            payload["deploy_signal"], payload["speed"],
+            src.provenance.originator_nation, list(src.provenance.releasable_to),
+            tier, os.getenv("OPENDDIL_REGION_ID", "region-01"))
+    except ValueError as exc:
+        raise OutputError(f"posture transition refused: {exc}") from exc
 
 
 def _window_event(

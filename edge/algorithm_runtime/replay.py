@@ -744,6 +744,7 @@ class OracleReport:
     first_diffs: list = field(default_factory=list)
     diff_by_field: dict = field(default_factory=dict)
     stamp_failures: int = 0
+    unstamped_kinds: list = field(default_factory=list)   # stamp_failures stay 0 for these
     core_counters: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
@@ -781,6 +782,16 @@ def _stamp_of(msg):
 
 
 def _diff_any(a, b) -> list[str]:
+    if isinstance(a, (bytes, bytearray)) or isinstance(b, (bytes, bytearray)):
+        # An unstamped kind's bytes: name the proto paths when both parse as
+        # telemetry, else just say bytes (never the content).
+        try:
+            pa, pb_ = pb.EntityTelemetryEvent(), pb.EntityTelemetryEvent()
+            pa.ParseFromString(a)
+            pb_.ParseFromString(b)
+            return _diff_paths(pa, pb_) or ["<bytes>"]
+        except Exception:  # noqa: BLE001
+            return ["<bytes>"]
     if isinstance(a, dict):
         return sorted(k for k in set(a) | set(b) if a.get(k) != b.get(k)) or ["<dict>"]
     return _diff_paths(a, b)
@@ -831,6 +842,7 @@ def compare_oracle(unit, decl, params, raw_records, env, name: str, synth_seed: 
             except (ImportError, AttributeError):
                 raise ReplayInputError(f"--synth-seed: {name}_v0 has no synth.make(seed)") from None
         kinds = {o.topic: o.kind for o in decl.outputs}
+        unstamped = {o.kind for o in decl.outputs if o.stamp == "none"}
         stamp = (decl.unit, decl.version, declaration.config_hash(decl.unit, decl.version, params), tier)
         r = OracleReport(oracle=f"{name}_v0")
         states: dict[str, dict] = {}
@@ -847,7 +859,12 @@ def compare_oracle(unit, decl, params, raw_records, env, name: str, synth_seed: 
             while old_q and new_q:
                 (o_no, o_msg), (n_no, n_msg) = old_q.popleft(), new_q.popleft()
                 r.compared += 1
-                a, b = normalize(key[1], _norm_out(o_msg)), normalize(key[1], _norm_out(n_msg))
+                if key[1] in unstamped:
+                    # Compared exactly: raw bytes, or the parsed JSON of a
+                    # transition. No clearing of id or time, no normalizing.
+                    a, b = o_msg, n_msg
+                else:
+                    a, b = normalize(key[1], _norm_out(o_msg)), normalize(key[1], _norm_out(n_msg))
                 if a == b:
                     r.equal += 1
                     continue
@@ -896,7 +913,7 @@ def compare_oracle(unit, decl, params, raw_records, env, name: str, synth_seed: 
             for topic, _k, msg in sends:
                 kind = kinds[topic]
                 emitted_new[kind] += 1
-                if _stamp_of(msg) != stamp:
+                if kind not in unstamped and _stamp_of(msg) != stamp:
                     r.stamp_failures += 1
                 pending.setdefault((asset_id, kind), (deque(), deque()))[1].append((n, msg))
                 touched.add((asset_id, kind))
@@ -907,6 +924,7 @@ def compare_oracle(unit, decl, params, raw_records, env, name: str, synth_seed: 
             r.new_only += len(new_q)
         r.topics = {decl.input_topic: n}
         r.assets = len(seen_assets)
+        r.unstamped_kinds = sorted(unstamped)
         r.emitted_old, r.emitted_new = dict(emitted_old), dict(emitted_new)
         r.diff_by_field = dict(diff_fields)
         r.core_counters = dict(counters)
@@ -944,7 +962,8 @@ def _oracle_summary(r: OracleReport, out: str, timing: dict) -> list[str]:
         f"emitted_old: {fmt(r.emitted_old)}   emitted_new: {fmt(r.emitted_new)}",
         f"compared={r.compared} equal={r.equal} different={r.different} "
         f"old_only={r.old_only} new_only={r.new_only}",
-        f"stamp_failures={r.stamp_failures}",
+        f"stamp_failures={r.stamp_failures}"
+        + (f" (stay 0: {', '.join(r.unstamped_kinds)} not stamped)" if r.unstamped_kinds else ""),
         "counters: " + (" ".join(f"{k}={n}" for k, n in sorted(r.core_counters.items())) or "none"),
     ]
     if r.diff_by_field:

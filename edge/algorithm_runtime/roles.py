@@ -18,6 +18,41 @@ _TEMPERATURES = {
 }
 
 
+def posture_inputs(evt: pb.EntityTelemetryEvent):
+    """Pull the posture state machine's three inputs out of the parsed event.
+
+    Returns (deploy_signal, speed, now):
+      - deploy_signal: the variant's deployment signal. The mapper passes at
+        most ONE per variant: launcher_raised (launcher variants) or emitting
+        (sensor variants). launcher_raised is checked first only as a
+        tie-break that should never occur. True/False if the field was set,
+        else None (the variant declares no signal, or no claim this tick) --
+        HasField, not a truthiness check, so an explicit False is never
+        confused with unset.
+      - speed: |velocity| in m/s, computed from kinematics.velocity.ecef
+        only (ground_speed is a separate, never-populated-for-DIS field --
+        see the ADR-0044 amendment). None if no ecef velocity was sent.
+      - now: provenance.sample_time as epoch seconds (the record's OWN event
+        time, not wall clock, so replay stays deterministic).
+    """
+    op = evt.operational_state
+    if op.HasField("launcher_raised"):
+        deploy_signal = op.launcher_raised
+    elif op.HasField("emitting"):
+        deploy_signal = op.emitting
+    else:
+        deploy_signal = None
+    vel = evt.kinematics.velocity
+    if vel.WhichOneof("frame") == "ecef":
+        v = vel.ecef
+        speed = (v.x * v.x + v.y * v.y + v.z * v.z) ** 0.5
+    else:
+        speed = None
+    ts = evt.provenance.sample_time
+    now = ts.seconds + ts.nanos / 1e9
+    return deploy_signal, speed, now
+
+
 def _quantity(q):
     """(magnitude, str(pint units)) for a proto Quantity, or None when it is
     unset (zero with no unit) or its unit is one pint cannot read: the test the
@@ -100,6 +135,11 @@ def extract(evt: pb.EntityTelemetryEvent, wanted=None) -> dict:
         sample_time_ns = int(time.time() * 1e9)
         out["sample_time_fallback"] = True
     out["sample_time_ns"] = sample_time_ns
+
+    if wanted is None or wanted & {"deploy_signal", "speed_mps", "sample_time_s"}:
+        # Present even when None: the posture unit needs to see the explicit
+        # None (no signal / no velocity), which a missing key would not say.
+        out["deploy_signal"], out["speed_mps"], out["sample_time_s"] = posture_inputs(evt)
 
     unconvertible = []
     for role, get in _TEMPERATURES.items():

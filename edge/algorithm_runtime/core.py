@@ -86,6 +86,10 @@ def process_one(unit, decl: Declaration, raw: bytes, state: dict | None,
         return None, [], counters
 
     work = dict(state) if state is not None else default_state(decl)
+    # A transition output is the host's to enforce: remember the watched field
+    # as the step found it, to see whether the step changed it.
+    watched = {o.on_change_of: copy.deepcopy(work.get(o.on_change_of))
+               for o in decl.outputs if o.output_class == "transition"}
     try:
         result = unit.step(sample, work)
     except Exception:  # noqa: BLE001 - a unit bug skips the sample, never the stream
@@ -104,8 +108,16 @@ def process_one(unit, decl: Declaration, raw: bytes, state: dict | None,
     stamp = _stamp_hash(unit, decl)
     tier = os.environ["OPENDDIL_EDGE_ID"]
     declared = {o.kind: o for o in decl.outputs}
-    for kind, payload in (result or {}).items():
+    result = result or {}
+    # Declaration order, so a unit's outputs go out in the order its YAML names
+    # them; a kind the declaration lacks is refused below, after the rest.
+    order = [o.kind for o in decl.outputs if o.kind in result] + [k for k in result if k not in declared]
+    for kind in order:
+        payload = result[kind]
         out = declared.get(kind)
+        if out is not None and out.output_class == "transition" and work[out.on_change_of] == watched[out.on_change_of]:
+            counters["transition_suppressed"] += 1
+            continue
         try:
             if out is None:
                 raise outputs.OutputError(f"{decl.unit} returned undeclared output kind {kind!r}")
@@ -115,7 +127,7 @@ def process_one(unit, decl: Declaration, raw: bytes, state: dict | None,
                 extra["rollup"] = window_rollup(asset_id)
             evt_out = outputs.build_event(
                 evt, msg, out, unit=decl.unit, version=decl.version,
-                config_hash=stamp, tier=tier, **extra,
+                config_hash=stamp, tier=tier, raw=raw, **extra,
             )
             if on_payload is not None:
                 on_payload(asset_id, kind, payload)
@@ -123,5 +135,6 @@ def process_one(unit, decl: Declaration, raw: bytes, state: dict | None,
             log.warning("%s: output refused for asset %s: %s", decl.unit, asset_id, exc)
             counters["output_refused"] += 1
             continue
-        sends.append((out.topic, asset_id.encode(), evt_out))
+        # An unstamped output keeps its old send's str key.
+        sends.append((out.topic, asset_id if out.stamp == "none" else asset_id.encode(), evt_out))
     return work, sends, counters

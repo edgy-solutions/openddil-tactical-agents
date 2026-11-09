@@ -15,6 +15,7 @@ setting it no longer reads would produce plausible wrong numbers.
 """
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import os
@@ -35,12 +36,15 @@ class StartupRefusal(RuntimeError):
     pass
 
 
-# The old in-line window path's env names, and the trends unit param each became.
-_LEGACY_WINDOW_ENV = {
-    "FLUID_WINDOW_MIN": "fluid_window_min",
-    "WEAR_WINDOW_MIN": "wear_window_min",
-    "WINDOW_EMIT_EVERY_N": "emit_every_n_samples",
-    "WINDOW_DEQUE_CAP": "window_cap",
+# The old in-line paths' env names, and the (unit, param) each became.
+_LEGACY_UNIT_ENV = {
+    "FLUID_WINDOW_MIN": ("trends", "fluid_window_min"),
+    "WEAR_WINDOW_MIN": ("trends", "wear_window_min"),
+    "WINDOW_EMIT_EVERY_N": ("trends", "emit_every_n_samples"),
+    "WINDOW_DEQUE_CAP": ("trends", "window_cap"),
+    "POSTURE_MOVE_SPEED_MPS": ("posture", "move_speed_mps"),
+    "POSTURE_MOVE_HOLD_S": ("posture", "move_hold_s"),
+    "POSTURE_STOP_HOLD_S": ("posture", "stop_hold_s"),
 }
 
 
@@ -54,12 +58,13 @@ def _refuse_legacy_env() -> None:
             f'set {{"wear": {{"{param}": <value>}}}} and unset {k} '
             f"(all set: {', '.join(legacy)})"
         )
-    old = sorted(k for k in _LEGACY_WINDOW_ENV if k in os.environ)
+    old = sorted(k for k in _LEGACY_UNIT_ENV if k in os.environ)
     if old:
         k = old[0]
+        unit, param = _LEGACY_UNIT_ENV[k]
         raise StartupRefusal(
             f"{k} is set but is no longer read. Parameters moved to ALGORITHM_PARAMS_JSON: "
-            f'set {{"trends": {{"{_LEGACY_WINDOW_ENV[k]}": <value>}}}} and unset {k} '
+            f'set {{"{unit}": {{"{param}": <value>}}}} and unset {k} '
             f"(all set: {', '.join(old)})"
         )
 
@@ -70,7 +75,9 @@ def make_record_class(decl: declaration.Declaration) -> type:
     records load into it unchanged."""
     annotations, body = {}, {}
     for f in decl.state_fields:
-        base = float if f.type == "number" else int
+        if f.persistence == "memory":
+            continue          # not in the record: the runner holds it per asset
+        base = {"number": float, "integer": int, "string": str}[f.type]
         annotations[f.name] = (base | None) if f.nullable else base
         body[f.name] = f.default
     body["__annotations__"] = annotations
@@ -102,6 +109,9 @@ class Wiring:
         self.last_window = last_window
         self.memory: dict[str, dict] = {}
         self.counters: dict = {}
+        # Memory-persistence fields of a durable unit: asset_id -> {field: value}.
+        self.field_names = [f.name for f in decl.state_fields if f.persistence == "memory"]
+        self.field_memory: dict[str, dict] = {}
 
     def _remember(self, asset_id: str, kind: str, payload) -> None:
         if kind == "window":
@@ -111,15 +121,25 @@ class Wiring:
         """(new_state or None, sends). `state` is the durable record's fields
         (None for none); a memory unit's is looked up here and kept here."""
         memory = self.decl.state_persistence == "memory"
-        asset = _asset_key(raw) if memory else ""
+        mixed = not memory and bool(self.field_names)
+        asset = _asset_key(raw) if memory or mixed else ""
         if memory:
             state = self.memory.get(asset) if asset else None
+        elif mixed and state is not None and asset:
+            held = self.field_memory.get(asset)
+            if held is None:
+                held = {f.name: copy.deepcopy(f.default) for f in self.decl.state_fields
+                        if f.persistence == "memory"}
+            state = {**state, **held}
         new_state, sends, new_counters = core.process_one(
             self.unit, self.decl, raw, state, record_time_ns,
             window_rollup=self.window_rollup, on_payload=self._remember)
         _count(self.counters, new_counters)
         if memory and new_state is not None:
             self.memory[asset] = new_state
+        elif mixed and new_state is not None and asset:
+            self.field_memory[asset] = {n: new_state[n] for n in self.field_names}
+            new_state = {k: v for k, v in new_state.items() if k not in self.field_names}
         return new_state, sends
 
 
@@ -240,7 +260,7 @@ def _wire(app: faust.App, decl: declaration.Declaration, unit: Unit, params: dic
     )
     wiring = Wiring(unit, decl, window_rollup, runner._last_window)
     runner.wirings[decl.unit] = wiring
-    names = [f.name for f in decl.state_fields]
+    names = [f.name for f in decl.state_fields if f.persistence != "memory"]
 
     @app.agent(in_topic, name=f"algorithm.{decl.unit}")
     async def algorithm_process(stream):
@@ -262,6 +282,7 @@ def _wire(app: faust.App, decl: declaration.Declaration, unit: Unit, params: dic
                 # lists each one a declared unit writes (one note per topic).
                 await out_topics[topic].send(  # produces: derived-sustainment
                     key=key,                   # produces: tactical-events
+                    # produces: telemetry-latest-state
                     value=outputs.encode(msg))  # produces: asset-telemetry-windows
 
 
