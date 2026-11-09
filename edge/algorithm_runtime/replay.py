@@ -40,13 +40,18 @@ from __future__ import annotations
 import argparse
 import base64
 import copy
+import gc
 import glob
 import gzip
 import json
 import logging
+import math
 import os
 import re
 import sys
+import time
+import tracemalloc
+from array import array
 from collections import Counter, deque
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -964,6 +969,170 @@ def load_unit(unit_dir: Path, decl: Declaration, params: Mapping) -> Unit:
 
 
 # --------------------------------------------------------------------------
+# --measure: one unit's memory and per-sample time over a recording
+# --------------------------------------------------------------------------
+_MIB = 1024 * 1024
+BASIS_RECORDED = "recorded"
+BASIS_SYNTHETIC = "recorded-timing-synthetic-values"
+
+
+def _percentile(sorted_vals, q: float) -> float:
+    """Nearest-rank percentile of an ascending sequence."""
+    k = max(1, math.ceil(q * len(sorted_vals)))
+    return float(sorted_vals[k - 1])
+
+
+def _measure_stream(raw_paths, decl: Declaration, synth: str | None, seed: int):
+    """(value, asset_id, record_time_ns, ts_ms) per raw record, with the
+    synth's values filled in when one is named. Preparation happens in the
+    generator, outside the timed call. A fresh synth per pass, so both passes
+    see identical values."""
+    fill = None
+    if synth is not None:
+        _load_oracle(synth)  # puts tests/oracle on sys.path
+        import importlib
+        try:
+            fill = importlib.import_module(f"{synth}_v0.synth").make(seed)
+        except (ImportError, AttributeError):
+            raise ReplayInputError(f"--synth: {synth}_v0 has no synth.make(seed)") from None
+    envelope_in = decl.input_format == "json-envelope"
+    for _offset, ts_ms, _key, value in read_records(raw_paths):
+        asset_id = ""
+        if envelope_in:
+            if fill is not None:
+                evt = pb.EntityTelemetryEvent()
+                try:
+                    evt.ParseFromString(value)
+                except Exception:  # noqa: BLE001 - not a telemetry record: no envelope to fill
+                    continue
+                value = fill(ts_ms, evt.asset.asset_id)
+            asset_id = core.envelope_asset(value)
+        else:
+            evt = pb.EntityTelemetryEvent()
+            try:
+                evt.ParseFromString(value)
+                if fill is not None:
+                    fill(evt)
+                    value = evt.SerializeToString()
+                asset_id = evt.asset.asset_id
+            except Exception:  # noqa: BLE001 - counted by process_one
+                pass
+        yield value, asset_id, ts_ms * 1_000_000, ts_ms
+
+
+def _encoded_len(decl: Declaration, state: dict) -> int:
+    """Bytes of the state's changelog record: compact JSON, the durable fields
+    in declaration order, then the record's namespace, as faust writes it."""
+    obj = {f.name: state[f.name] for f in decl.state_fields if f.persistence == "durable"}
+    obj["__faust"] = {"ns": decl.state_record_namespace}
+    return len(json.dumps(obj, separators=(",", ":")).encode("utf-8"))
+
+
+def measure(unit_dir: Path, decl: Declaration, params: Mapping, raw_paths, env: Mapping,
+            synth: str | None = None, synth_seed: int = 0) -> dict:
+    """Run the unit alone over the recording from a cold start, through
+    `core.process_one` (outputs built, nothing sent), twice.
+
+    The time pass has no tracemalloc, which would distort it. The memory pass
+    starts tracemalloc after the imports and the unit load, and reads with a
+    gc.collect() first. A run that never reached `unit.step` fails: there is
+    nothing to measure."""
+    tier = env.get("OPENDDIL_EDGE_ID", "")
+    if not tier:
+        raise ReplayInputError("env has no OPENDDIL_EDGE_ID: every output is stamped with its tier")
+    saved = {k: os.environ.get(k) for k in ("OPENDDIL_EDGE_ID", "OPENDDIL_REGION_ID")}
+    try:
+        for k in saved:
+            if env.get(k):
+                os.environ[k] = env[k]
+            else:
+                os.environ.pop(k, None)
+
+        def one_pass(timed: bool):
+            unit = load_unit(unit_dir, decl, params)
+            stream = _measure_stream(raw_paths, decl, synth, synth_seed)
+            states: dict[str, dict] = {}
+            counters: Counter = Counter()
+            ns_each = array("q")
+            read = steps = 0
+            first_ts = last_ts = None
+            if not timed:
+                gc.collect()
+                tracemalloc.start()
+            for value, asset_id, rt_ns, ts_ms in stream:
+                read += 1
+                first_ts = ts_ms if first_ts is None else first_ts
+                last_ts = ts_ms
+                prior = states.get(asset_id) if asset_id else None
+                if timed:
+                    t0 = time.perf_counter_ns()
+                    new_state, _sends, c = core.process_one(unit, decl, value, prior, rt_ns)
+                    ns_each.append(time.perf_counter_ns() - t0)
+                else:
+                    new_state, _sends, c = core.process_one(unit, decl, value, prior, rt_ns)
+                counters.update(c)
+                if new_state is not None:
+                    states[asset_id] = new_state
+                if new_state is not None or c.get("step_failed"):
+                    steps += 1
+            mem = None
+            if not timed:
+                gc.collect()
+                cur, peak = tracemalloc.get_traced_memory()
+                tracemalloc.stop()
+                mem = (cur, peak)
+            return states, counters, ns_each, read, steps, first_ts, last_ts, mem
+
+        states, counters, ns_each, read, steps, first_ts, last_ts, _ = one_pass(True)
+        if steps == 0:
+            raise ReplayInputError(
+                f"{decl.unit}: steps_run is 0 over {read} records ({dict(counters)}): "
+                "no record reached unit.step, so nothing was measured")
+        span_s = (last_ts - first_ts) / 1000.0
+        if span_s <= 0:
+            raise ReplayInputError(f"{decl.unit}: the records span no time (first and last ts_ms are equal)")
+        ordered = sorted(ns_each)
+        mean_ns = sum(ns_each) / len(ns_each)
+        rate = read / span_s
+
+        states2, _c2, _n2, read2, steps2, _f2, _l2, mem = one_pass(False)
+        if (read2, steps2) != (read, steps):
+            raise ReplayInputError(f"{decl.unit}: the two passes saw different records ({read}/{steps} vs {read2}/{steps2})")
+        cur, peak = mem
+        assets = len(states2)
+        if decl.state_persistence == "durable":
+            state_bytes = sum(_encoded_len(decl, s) for s in states2.values()) / assets
+        else:
+            state_bytes = cur / assets
+        return {
+            "unit": decl.unit,
+            "basis": BASIS_SYNTHETIC if synth else BASIS_RECORDED,
+            "synth": synth,
+            "synth_seed": synth_seed if synth else None,
+            "python": ".".join(str(v) for v in sys.version_info[:3]),
+            "records_read": read,
+            "steps_run": steps,
+            "records": steps,
+            "assets": assets,
+            "span_s": span_s,
+            "rate_per_s": rate,
+            "per_sample_ns": {"mean": mean_ns, "p50": _percentile(ordered, 0.50),
+                              "p99": _percentile(ordered, 0.99), "max": float(ordered[-1])},
+            "cpu_millicores": mean_ns * rate / 1e6,
+            "peak_python_mib": peak / _MIB,
+            "end_python_mib": cur / _MIB,
+            "state_bytes_per_asset": round(state_bytes),
+            "core_counters": dict(counters),
+        }
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
+# --------------------------------------------------------------------------
 # CLI
 # --------------------------------------------------------------------------
 def _expand(pattern: str, what: str) -> list[str]:
@@ -991,6 +1160,19 @@ def _oracle_summary(r: OracleReport, out: str, timing: dict) -> list[str]:
         lines.append(f"wall seconds in each side: old={timing['old']:.2f} new={timing['new']:.2f}")
     lines.append(f"report: {out}")
     return lines
+
+
+def _measure_summary(m: dict, out: str) -> list[str]:
+    t = m["per_sample_ns"]
+    return [
+        f"mode: MEASURE {m['unit']}, basis {m['basis']}: cold start, process_one with outputs built, nothing sent",
+        f"records_read={m['records_read']} steps_run={m['steps_run']} assets={m['assets']} "
+        f"span_s={m['span_s']:.1f} rate_per_s={m['rate_per_s']:.3f}",
+        f"per_sample_us: mean={t['mean'] / 1e3:.2f} p50={t['p50'] / 1e3:.2f} p99={t['p99'] / 1e3:.2f} max={t['max'] / 1e3:.2f}",
+        f"cpu_millicores={m['cpu_millicores']:.4f} peak_python_mib={m['peak_python_mib']:.3f} "
+        f"end_python_mib={m['end_python_mib']:.3f} state_bytes_per_asset={m['state_bytes_per_asset']}",
+        f"report: {out}",
+    ]
 
 
 def _summary(r: Report, out: str) -> list[str]:
@@ -1027,8 +1209,8 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="algorithm_runtime.replay", description=__doc__.split("\n")[0])
     ap.add_argument("--unit-dir", required=True)
     ap.add_argument("--params-json", default="{}", help="the unit's parameter overrides, a JSON object")
-    ap.add_argument("--edge-id", required=True)
-    ap.add_argument("--region-id", required=True)
+    ap.add_argument("--edge-id", help="required except with --measure")
+    ap.add_argument("--region-id", help="required except with --measure")
     ap.add_argument("--raw", required=True, help="glob of recorded raw input files")
     ap.add_argument("--recorded", help="glob of recorded output files (not read in count-only mode)")
     ap.add_argument("--snapshot", help="glob of the changelog snapshot the replay starts from (not read in count-only mode)")
@@ -1040,7 +1222,13 @@ def main(argv=None) -> int:
     ap.add_argument("--compare-oracle", metavar="NAME",
                     help="run tests/oracle/NAME_v0 and the unit over the same raw records and compare exactly")
     ap.add_argument("--synth-seed", type=int,
-                    help="with --compare-oracle: fill values the recording lacks, from the oracle package's synth")
+                    help="with --compare-oracle: fill values the recording lacks, from the oracle package's synth "
+                         "(with --measure the seed defaults to 0)")
+    ap.add_argument("--measure", action="store_true",
+                    help="run the unit alone over the recording and report its memory and per-sample time")
+    ap.add_argument("--synth", metavar="NAME",
+                    help="with --measure: fill values the recording lacks from tests/oracle/NAME_v0/synth.py; "
+                         "the result's basis is then recorded-timing-synthetic-values")
     args = ap.parse_args(argv)
     try:
         unit_dir = Path(args.unit_dir)
@@ -1054,8 +1242,23 @@ def main(argv=None) -> int:
         params = declaration.resolve_params(decl, overrides)
         unit = load_unit(unit_dir, decl, params)
         raw = _expand(args.raw, "raw")
+        if args.measure:
+            if args.compare_oracle:
+                raise ReplayInputError("--measure and --compare-oracle are different modes")
+            res = measure(unit_dir, decl, params, raw,
+                          {"OPENDDIL_EDGE_ID": args.edge_id or "edge-measure",
+                           "OPENDDIL_REGION_ID": args.region_id or "region-measure"},
+                          args.synth, args.synth_seed or 0)
+            Path(args.out).write_text(json.dumps(res, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+            print("\n".join(_measure_summary(res, args.out)))
+            return 0
+        for name in ("edge_id", "region_id"):
+            if not getattr(args, name):
+                raise ReplayInputError(f"--{name.replace('_', '-')} is required")
+        if args.synth is not None:
+            raise ReplayInputError("--synth needs --measure")
         if args.synth_seed is not None and not args.compare_oracle:
-            raise ReplayInputError("--synth-seed needs --compare-oracle")
+            raise ReplayInputError("--synth-seed needs --compare-oracle (or --measure)")
         if args.compare_oracle and decl.input_format == "json-envelope" and args.synth_seed is None:
             raise ReplayInputError("a json-envelope unit's recording holds no envelopes: --synth-seed is required")
         if args.compare_oracle:
