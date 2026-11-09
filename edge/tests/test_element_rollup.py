@@ -48,10 +48,26 @@ def _envelope(**extra) -> dict:
 @pytest.fixture(autouse=True)
 def _clean_state():
     faust_edge.element_rollups.clear()
-    faust_edge.window_buffers.clear()
     yield
     faust_edge.element_rollups.clear()
-    faust_edge.window_buffers.clear()
+
+
+class _LastWindow:
+    """Stands in for the runner: the trends unit's last window payload per
+    asset, as `Runner.last_window` hands it back."""
+
+    def __init__(self, payloads=None):
+        self.payloads = payloads or {}
+
+    def last_window(self, aid):
+        return self.payloads.get(aid)
+
+
+@pytest.fixture
+def last_windows(monkeypatch):
+    stub = _LastWindow()
+    monkeypatch.setattr(faust_edge, "algorithm_runner", stub)
+    return stub
 
 
 def test_counts_means_and_band_edges():
@@ -120,36 +136,71 @@ def test_unlabelled_envelope_yields_unlabelled_window():
     assert w.element_rollup.element_count == 6
 
 
-def test_raw_path_window_carries_cached_rollup():
+def _trend(latest, slope, unit="liter", n=3):
+    return {"latest": latest, "latest_unit": unit, "slope": slope, "slope_unit": unit + "/h",
+            "r_squared": 1.0, "latest_sample_ns": OBS_NS - 1_000_000_000,
+            "window_start_ns": OBS_NS - 3_000_000_000, "sample_count": n}
+
+
+def _payload(**kw):
+    p = {"window_start_ns": OBS_NS - 3_000_000_000, "window_end_ns": OBS_NS, "sample_count": 3,
+         "fluid_trends": {}, "consumable_trends": [], "wear_trends": [], "active_fault_codes": []}
+    p.update(kw)
+    return p
+
+
+def test_trends_unit_window_carries_the_cached_rollup():
+    """The raw path's window is now the trends unit's, built by the runtime
+    with the rollup hook this module hands it (`element_rollups.get`)."""
+    import shutil, tempfile  # noqa: E401
+    from algorithm_runtime import core, declaration, guard, loader
+    d = Path(__file__).resolve().parents[2] / "algorithms" / "trends"
+    decl = declaration.load(d / "unit.yaml")
+    guard.check_unit_dir(d)
+    unit = loader.load_unit_class(d, decl, RuntimeError)(declaration.resolve_params(decl, {"emit_every_n_samples": 1}))
     evt = pb.EntityTelemetryEvent()
     evt.asset.asset_id = "asset-a"
     evt.asset.platform_variant = "variant-x"
-    faust_edge._buffer_event(evt, OBS_NS)
     evt.sustainment.fluids.fuel_remaining.value = 50.0
     evt.sustainment.fluids.fuel_remaining.unit = "L"
-    faust_edge._buffer_event(evt, OBS_NS)
+    raw = evt.SerializeToString()
 
-    assert faust_edge.window_buffers.get("asset-a")
-    w = faust_edge._emit_window_for_asset(evt, OBS_NS)
-    assert w is not None and not w.HasField("element_rollup")
+    _st, sends, _c = core.process_one(unit, decl, raw, None, 1_000_000_000,
+                                      window_rollup=faust_edge.element_rollups.get)
+    assert len(sends) == 1 and not sends[0][2].HasField("element_rollup")
 
     faust_edge.element_rollups["asset-a"] = rollup_from_envelope(_envelope())
-    w = faust_edge._emit_window_for_asset(evt, OBS_NS)
-    assert w.element_rollup.critical_count == 2
+    _st, sends, _c = core.process_one(unit, decl, raw, None, 2_000_000_000,
+                                      window_rollup=faust_edge.element_rollups.get)
+    assert sends[0][2].element_rollup.critical_count == 2
 
 
-def test_element_window_carries_existing_trends():
-    from detection.windows import Sample
-    from pint import UnitRegistry
-    ureg = UnitRegistry()
-    dq = faust_edge.deque()
-    for i in range(3):
-        dq.append(Sample(epoch_ns=OBS_NS - (3 - i) * 1_000_000_000,
-                         quantity=ureg.Quantity(100.0 - i, "liter")))
-    faust_edge.window_buffers["asset-a"] = {"fluid:fuel_remaining": dq}
+def test_element_window_carries_the_last_trends_payload(last_windows):
+    last_windows.payloads["asset-a"] = _payload(fluid_trends={"fuel_remaining": _trend(98.0, -2.0)})
     w = _element_window(_envelope())
     assert "fuel_remaining" in w.fluid_trends
+    assert w.fluid_trends["fuel_remaining"].latest.value == 98.0
     assert w.element_rollup.element_count == 6
+    # the span is still the snapshot's own instant; the count is the payload's
+    assert w.window.window_start.ToNanoseconds() == OBS_NS
+    assert w.window.sample_count == 3
+
+
+def test_element_window_without_a_trends_window_has_no_trends(last_windows):
+    w = _element_window(_envelope())
+    assert len(w.fluid_trends) == 0 and len(w.consumable_trends) == 0 and len(w.wear_trends) == 0
+    assert w.window.sample_count == 0 and w.element_rollup.element_count == 6
+
+
+def test_element_window_does_not_mix_assets(last_windows):
+    last_windows.payloads["asset-b"] = _payload(fluid_trends={"fuel_remaining": _trend(1.0, 0.0)})
+    assert len(_element_window(_envelope()).fluid_trends) == 0
+
+
+def test_element_window_survives_an_unusable_trends_payload(last_windows):
+    last_windows.payloads["asset-a"] = {"not": "a window"}
+    w = _element_window(_envelope())
+    assert len(w.fluid_trends) == 0 and w.element_rollup.element_count == 6
 
 
 COND = {

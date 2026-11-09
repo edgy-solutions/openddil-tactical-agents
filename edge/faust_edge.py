@@ -20,7 +20,6 @@ DEPLOYMENT NOTE:
 import logging
 import os
 import time
-from collections import deque
 from typing import Optional
 
 import faust
@@ -29,13 +28,7 @@ from openddil.logistics.v1 import windowed_telemetry_pb2 as winpb
 from element_rollup import rollup_from_envelope
 from element_band_event import build_band_event
 from element_bands import BandTracker, parse_config as parse_band_config
-from detection.windows import (
-    Sample,
-    build_window_spec,
-    compute_trend,
-    proto_to_pint,
-    trend_to_proto,
-)
+from detection.windows import build_window_spec
 # ADR-0044 amendment ("posture, a third column") -- a pure sibling module,
 # no Faust/proto types (same boundary discipline as detection/units.py).
 # Aliased so the StateRecord field named `posture` below never shadows it.
@@ -48,6 +41,7 @@ logger = logging.getLogger(__name__)
 # own agent + Table; this is the *only* coupling. To extract the runner into
 # its own service later, delete the import and the call site at the bottom of
 # this file.
+from algorithm_runtime import outputs as algorithm_outputs
 from algorithm_runtime.runner import register as register_algorithms
 
 # ADR-0023 §Faust-edge: per-edge instance gets a distinct FAUST_APP_ID so
@@ -148,15 +142,6 @@ windows_topic = app.topic("asset-telemetry-windows", value_type=bytes)
 ELEMENT_TOPIC = os.getenv("ELEMENT_TOPIC", "asset-element-telemetry")
 element_topic = app.topic(ELEMENT_TOPIC, value_type=bytes)
 
-# Window sizing — env-driven for ops tuning without code change.
-FLUID_WINDOW_NS = int(float(os.getenv("FLUID_WINDOW_MIN", "15")) * 60 * 1e9)
-WEAR_WINDOW_NS  = int(float(os.getenv("WEAR_WINDOW_MIN",  "60")) * 60 * 1e9)
-EMIT_EVERY_N_SAMPLES = int(os.getenv("WINDOW_EMIT_EVERY_N", "5"))
-# How many points per signal to retain — sized so a 60-min wear window with
-# 1 sample/sec stays in memory comfortably. Tune via env if telemetry rates
-# differ.
-DEQUE_CAP = int(os.getenv("WINDOW_DEQUE_CAP", "4096"))
-
 # Faust-managed state record for RocksDB serialization.
 class StateRecord(faust.Record):
     # The three thermal fields are no longer written (thermal runs as the
@@ -187,27 +172,16 @@ asset_state = app.Table(
     partitions=1,
 )
 
-# ---------------------------------------------------------------------------
-# Rolling-window state — per-process in-memory buffers (Phase 3.5).
-#
-# Schema: window_buffers[asset_id][signal_key] -> deque[Sample]
-# where signal_key is one of:
-#   - "fluid:fuel_remaining"
-#   - f"ammo:{slot}"
-#   - f"wear_hours:{component}"
-#   - f"wear_rul:{component}"
-#
-# Buffers live in process memory; loss on restart is acceptable because
-# trends regenerate within minutes from the live feed (no per-asset durable
-# state lives here — that's the logistics fusion service's job).
-# ---------------------------------------------------------------------------
-window_buffers: dict[str, dict[str, deque]] = {}
-samples_since_last_emit: dict[str, int] = {}
-# Latest element rollup per asset. Both window producers (the raw path and the
-# element path) write the same key on the windows topic, so each attaches this
-# cache and neither clears what the other contributed.
+# Rolling-window trends are the `trends` declared unit's (algorithms/trends).
+# The runner keeps each asset's last window payload; the element path below
+# reads it through `algorithm_runner.last_window`. Nothing windowed lives here.
+# Latest element rollup per asset. Both window producers (the trends unit on
+# the raw path and the element path) write the same key on the windows topic,
+# so each attaches this cache and neither clears what the other contributed.
 element_rollups: dict[str, winpb.ElementRollup] = {}
 _rollup_logged: set[str] = set()
+# Set by `register_algorithms` at the bottom of the file.
+algorithm_runner = None
 
 # Element band events (edge/element_bands.py). The band config is rendered
 # into ELEMENT_BANDS_JSON by the chart; absent means off, invalid fails the
@@ -265,173 +239,21 @@ def band_events_for_envelope(env: dict, tracker, config: dict,
     return out
 
 
-def _emit_window_for_asset(evt: pb.EntityTelemetryEvent,
-                            now_ns: int) -> winpb.WindowedTelemetry | None:
-    """Build a WindowedTelemetry from the buffered samples for one asset.
-    Returns None if there isn't enough data yet (no trend possible)."""
-    aid = evt.asset.asset_id
-    if not window_buffers.get(aid):
-        return None
-    return _build_window(
-        aid,
-        evt.asset.platform_variant or "",
-        now_ns,
-        sample_time=evt.provenance.sample_time,
-        originator_nation=evt.provenance.originator_nation,
-        releasable_to=evt.provenance.releasable_to,
-        evt=evt,
-    )
-
-
-def _build_window(aid: str,
-                  platform_variant: str,
-                  now_ns: int,
-                  *,
-                  sample_time=None,
-                  originator_nation: str = "",
-                  releasable_to=(),
-                  evt: pb.EntityTelemetryEvent | None = None,
-                  window_range_ns: tuple[int, int] | None = None,
-                  ) -> winpb.WindowedTelemetry:
-    """Shared window construction for both producers: the raw path (which
-    passes the source event, for capacity and fault passthrough) and the
-    element path (which passes only the envelope's labels and a fixed range).
-    Carries whatever sustainment trends this asset's buffers already hold and
-    the cached element rollup, if any."""
-    buffers = window_buffers.get(aid, {})
-
-    out = winpb.WindowedTelemetry()
-    out.asset_id = aid
-    out.platform_variant = platform_variant
-    out.computed_at.FromNanoseconds(now_ns)
-    # ADR-0023 Phase 6b §A.2: stamp origin-node provenance from this
-    # faust-edge instance's env (faust-edge is already per-edge). The
-    # projector telemetry_windows handler reads this with env-default
-    # fallback; faust-regional's region-wear-trends aggregator (§B)
-    # consumes it as an attributed input. Inherit producer_id/sample_time
-    # from the source event when possible.
-    if sample_time is not None and (sample_time.seconds or sample_time.nanos):
-        out.provenance.sample_time.CopyFrom(sample_time)
-    out.provenance.producer_id = "faust-edge"
-    out.provenance.edge_id = OPENDDIL_EDGE_ID
-    out.provenance.region_id = OPENDDIL_REGION_ID
-    out.provenance.ingest_time.FromNanoseconds(now_ns)
-    out.provenance.classification = "U"
-
-    # ADR-0029 §3: PROPAGATE, do not derive. A window is a rollup of ONE
-    # asset's own samples, so it inherits that asset's labels whole -- this
-    # is not the aggregate case the regional aggregator handles, where rows
-    # from several authors are combined and no one of them may claim
-    # authorship of the result. Here there is exactly one author and it is
-    # the same author as the source event.
-    #
-    # WITHOUT THIS COPY the windowed path is lossy, and lossy in the
-    # direction that reads as correct: an asset reaching fusion only through
-    # `asset-telemetry-windows` would arrive unlabelled and be refused at
-    # the egress gate as `unlabelled` -- indistinguishable from an asset
-    # nobody declared, with the fix appearing to belong at an ingress that
-    # had in fact done its job. It did not bite because raw-sensor-stream is
-    # also a direct fusion input and fusion's stored label is sticky, so one
-    # labelled inbound was enough to mask it.
-    #
-    # No else-branch and no default. An unlabelled source event produces an
-    # unlabelled window, which the gate then refuses; inventing a value here
-    # would hide the thing the gate exists to surface.
-    if originator_nation:
-        out.provenance.originator_nation = originator_nation
-    if releasable_to:
-        out.provenance.releasable_to.extend(releasable_to)
-
-    total_samples = 0
-    window_min_start: int | None = None
-
-    # Fluid trends (fuel and any future named fluid)
-    for key, dq in buffers.items():
-        if not key.startswith("fluid:"):
-            continue
-        signal = key.split(":", 1)[1]
-        trend = compute_trend(list(dq), window_ns=FLUID_WINDOW_NS, now_ns=now_ns)
-        if trend is None:
-            continue
-        out.fluid_trends[signal].CopyFrom(trend_to_proto(trend))
-        total_samples += trend.sample_count
-        if window_min_start is None or trend.window_start_ns < window_min_start:
-            window_min_start = trend.window_start_ns
-
-    # Consumable trends — group by slot key
-    ammo_slots: dict[str, dict] = {}
-    for key, dq in buffers.items():
-        if not key.startswith("ammo:"):
-            continue
-        slot = key.split(":", 1)[1]
-        trend = compute_trend(list(dq), window_ns=FLUID_WINDOW_NS, now_ns=now_ns)
-        if trend is None:
-            continue
-        ammo_slots[slot] = {"trend": trend}
-    # Capacity passthrough from the latest event
-    for slot, info in ammo_slots.items():
-        cs = (evt.sustainment.consumables.items.get(slot)
-              if evt is not None else None)
-        t = out.consumable_trends.add()
-        t.slot_key = slot
-        t.remaining.CopyFrom(trend_to_proto(info["trend"]))
-        if cs is not None:
-            t.capacity = cs.quantity_capacity
-            t.nsn = cs.nsn
-
-    # Wear trends — pair hours_in_service with remaining_useful_life per component
-    component_names = set()
-    for key in buffers:
-        if key.startswith("wear_hours:"):
-            component_names.add(key.split(":", 1)[1])
-    for comp in component_names:
-        hours_buf = buffers.get(f"wear_hours:{comp}")
-        rul_buf   = buffers.get(f"wear_rul:{comp}")
-        if hours_buf is None or rul_buf is None:
-            continue
-        h_trend = compute_trend(list(hours_buf),
-                                 window_ns=WEAR_WINDOW_NS, now_ns=now_ns)
-        r_trend = compute_trend(list(rul_buf),
-                                 window_ns=WEAR_WINDOW_NS, now_ns=now_ns)
-        if h_trend is None and r_trend is None:
-            continue
-        t = out.wear_trends.add()
-        t.component_key = comp
-        if h_trend is not None:
-            t.hours_in_service.CopyFrom(trend_to_proto(h_trend))
-        if r_trend is not None:
-            t.remaining_useful_life.CopyFrom(trend_to_proto(r_trend))
-
-    # Latest subsystem-fault tokens (passthrough — not aggregated)
-    if evt is not None and list(evt.sustainment.health.active_fault_codes):
-        out.active_fault_codes_latest.extend(
-            list(evt.sustainment.health.active_fault_codes),
-        )
-
-    # WindowSpec — use the widest range we covered.
-    if window_range_ns is not None:
-        start_ns, end_ns = window_range_ns
-    else:
-        start_ns, end_ns = window_min_start or now_ns, now_ns
-    out.window.CopyFrom(build_window_spec(
-        window_start_ns=start_ns,
-        window_end_ns=end_ns,
-        sample_count=total_samples,
-    ))
-
-    rollup = element_rollups.get(aid)
-    if rollup is not None:
-        out.element_rollup.CopyFrom(rollup)
-    return out
-
-
 def _window_from_envelope(env: dict,
                           rollup: winpb.ElementRollup,
                           now_ns: int) -> winpb.WindowedTelemetry:
     """Window for the element path: the window spans the snapshot's own
     observation instant, and labels come from the envelope (ADR-0029
-    PROPAGATE, no default -- see _build_window). The rollup is attached from
-    the cache, so the caller stores it there first."""
+    PROPAGATE, no default: an envelope without labels gives an unlabelled
+    window, which the egress gate then refuses). The rollup is attached from
+    the cache, so the caller stores it there first.
+
+    The sustainment trends are the `trends` unit's last window for this asset
+    (the runner keeps it), carried as they were when the unit emitted them:
+    they are not recomputed at this window's time, and they include what that
+    payload carried (capacity and nsn on the ammunition entries, the latest
+    fault codes). When the unit has emitted nothing for the asset yet the
+    window has none."""
     aid = env.get("asset_id") or ""
     obs_ns = (rollup.observed_at.ToNanoseconds()
               if rollup.HasField("observed_at") else now_ns)
@@ -439,47 +261,37 @@ def _window_from_envelope(env: dict,
     if not isinstance(releasable, list):
         releasable = []
     nation = env.get("originator_nation") or ""
-    return _build_window(
-        aid,
-        env.get("platform_variant") or "",
-        now_ns,
-        originator_nation=nation if isinstance(nation, str) else "",
-        releasable_to=[r for r in releasable if isinstance(r, str)],
-        window_range_ns=(obs_ns, obs_ns),
-    )
+    last = algorithm_runner.last_window(aid) if algorithm_runner is not None else None
 
-
-def _buffer_event(evt: pb.EntityTelemetryEvent, now_ns: int) -> None:
-    """Add the event's sustainment quantities to the per-asset window buffers."""
-    aid = evt.asset.asset_id
-    if not aid:
-        return
-    buffers = window_buffers.setdefault(aid, {})
-
-    def _push(signal_key: str, proto_qty) -> None:
-        pq = proto_to_pint(proto_qty)
-        if pq is None:
-            return
-        dq = buffers.setdefault(signal_key, deque(maxlen=DEQUE_CAP))
-        dq.append(Sample(epoch_ns=now_ns, quantity=pq))
-
-    _push("fluid:fuel_remaining", evt.sustainment.fluids.fuel_remaining)
-
-    for slot, state in evt.sustainment.consumables.items.items():
-        if state.quantity_capacity > 0:
-            # Convert remaining count to a dimensionless quantity so the
-            # regression has consistent units.
-            from pint import UnitRegistry
-            ureg = UnitRegistry()
-            dq = buffers.setdefault(f"ammo:{slot}", deque(maxlen=DEQUE_CAP))
-            dq.append(Sample(
-                epoch_ns=now_ns,
-                quantity=ureg.Quantity(float(state.quantity_remaining), "count"),
-            ))
-
-    for comp, state in evt.sustainment.wear.components.items():
-        _push(f"wear_hours:{comp}", state.hours_in_service)
-        _push(f"wear_rul:{comp}",   state.remaining_useful_life)
+    out = winpb.WindowedTelemetry()
+    trend_samples = 0
+    if last is not None:
+        try:
+            out.CopyFrom(algorithm_outputs.build_payload("window", last))
+            trend_samples = int(last["sample_count"])
+        except (algorithm_outputs.OutputError, KeyError) as exc:
+            logger.warning("element window for %s: last trends payload unusable: %s", aid, exc)
+            out = winpb.WindowedTelemetry()
+    out.asset_id = aid
+    out.platform_variant = env.get("platform_variant") or ""
+    out.computed_at.FromNanoseconds(now_ns)
+    # ADR-0023 Phase 6b section A.2: origin-node provenance from this
+    # instance's env (faust-edge is per-edge).
+    out.provenance.producer_id = "faust-edge"
+    out.provenance.edge_id = OPENDDIL_EDGE_ID
+    out.provenance.region_id = OPENDDIL_REGION_ID
+    out.provenance.ingest_time.FromNanoseconds(now_ns)
+    out.provenance.classification = "U"
+    if isinstance(nation, str) and nation:
+        out.provenance.originator_nation = nation
+    out.provenance.releasable_to.extend(r for r in releasable if isinstance(r, str))
+    out.window.CopyFrom(build_window_spec(
+        window_start_ns=obs_ns,
+        window_end_ns=obs_ns,
+        sample_count=trend_samples,
+    ))
+    out.element_rollup.CopyFrom(rollup)
+    return out
 
 
 @app.agent(element_topic)
@@ -611,25 +423,10 @@ async def process(stream):
                 )).encode("utf-8"),
             )
 
-        # 1a. Windowing — buffer this sample and (every N samples) emit a
-        # WindowedTelemetry for the logistics fusion service.
-        now_ns = int(time.time() * 1e9)
-        _buffer_event(evt, now_ns)
-        if aid:
-            samples_since_last_emit[aid] = samples_since_last_emit.get(aid, 0) + 1
-            if samples_since_last_emit[aid] >= EMIT_EVERY_N_SAMPLES:
-                samples_since_last_emit[aid] = 0
-                w = _emit_window_for_asset(evt, now_ns)
-                if w is not None:
-                    await windows_topic.send(
-                        key=aid.encode(),
-                        value=w.SerializeToString(),
-                    )
-
         # One write per record: the posture fields set on `rec` above.
         asset_state[aid] = rec
 
-register_algorithms(app)
+algorithm_runner = register_algorithms(app, window_rollup=element_rollups.get)
 
 if __name__ == "__main__":
     app.main()
