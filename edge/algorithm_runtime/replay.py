@@ -825,9 +825,10 @@ def compare_oracle(unit, decl, params, raw_records, env, name: str, synth_seed: 
         normalize = getattr(pkg, "normalize", lambda _kind, m: m)
         fill = None
         if synth_seed is not None:
+            import importlib
             try:
-                fill = pkg.synth.make(synth_seed)
-            except AttributeError:
+                fill = importlib.import_module(f"{name}_v0.synth").make(synth_seed)
+            except (ImportError, AttributeError):
                 raise ReplayInputError(f"--synth-seed: {name}_v0 has no synth.make(seed)") from None
         kinds = {o.topic: o.kind for o in decl.outputs}
         stamp = (decl.unit, decl.version, declaration.config_hash(decl.unit, decl.version, params), tier)

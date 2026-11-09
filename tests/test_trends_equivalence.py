@@ -160,3 +160,28 @@ def test_cli_compare_oracle_writes_a_report_and_exits_zero(tmp_path, capsys):
     rc = replay.main(["--unit-dir", str(TRENDS_DIR), "--edge-id", "edge-tst", "--region-id", "region-tst",
                       "--raw", str(d / "*.gz"), "--out", str(out), "--compare-oracle", "trends", "--synth-seed", "3"])
     assert rc == 0
+
+
+def test_synth_seed_works_in_a_fresh_interpreter(tmp_path):
+    """--synth-seed must not depend on anything having imported the oracle's
+    synth module already (a fresh process, as the CLI is run)."""
+    import base64
+    import gzip
+    import os
+    import subprocess
+    d = tmp_path / "raw"
+    d.mkdir()
+    with gzip.open(d / "raw-sensor-stream.0-199.gz", "wb") as fh:
+        for i in range(200):
+            e = pb.EntityTelemetryEvent()
+            e.asset.asset_id = "a"
+            fh.write(b" ".join([str(i).encode(), str(1_700_000_000_000 + i * 1000).encode(),
+                                base64.b64encode(b"k"), base64.b64encode(e.SerializeToString())]) + b"\n")
+    env = dict(os.environ, PYTHONPATH=os.pathsep.join([str(ROOT / "edge"), os.environ.get("PYTHONPATH", "")]))
+    out = subprocess.run(
+        [sys.executable, "-m", "algorithm_runtime.replay", "--unit-dir", str(TRENDS_DIR), "--edge-id", "e",
+         "--region-id", "r", "--raw", str(d / "*.gz"), "--out", str(tmp_path / "o.json"),
+         "--compare-oracle", "trends", "--synth-seed", "3"],
+        capture_output=True, text=True, env=env)
+    assert out.returncode == 0, out.stdout[-400:] + out.stderr[-400:]
+    assert json.loads((tmp_path / "o.json").read_text())["emitted_new"].get("window", 0) > 0
