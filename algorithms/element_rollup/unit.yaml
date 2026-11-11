@@ -30,5 +30,16 @@ outputs:
     direction: upward
     stamp: none                    # the window carries no unit stamp, as before; the host supplies producer faust-edge
     labels: copy-source
-resources: {memory_mi: 8, cpu_m: 10}   # unmeasured; a ceiling until the measure step replaces it
+resources: {memory_mi: 1, cpu_m: 1}   # the larger edge's measured peak and mean cpu, ceil, no margin; leaves out Faust and RocksDB overhead, broker client buffers and the pod's own CPU (host is not the edge node)
+measured:
+  date: "2026-11-10"
+  recording: "second lab, rev 30, t0 2026-11-08T02:12:42Z, through the 2026-11-11T02:37Z pull; edge-02's run (the larger mean cpu 0.648 m; edge-01: 470889 records, 9 assets, mean 209.0 us, 0.376 m, peak 0.754 MiB, 567 state bytes per asset)"
+  basis: recorded-timing-synthetic-values
+  host: "lane 03 dev host, not the edge node; python 3.11.1"
+  records: 418618
+  assets: 8
+  rate_per_s: 1.599
+  per_sample_us: {mean: 405.4, p99: 3815.9, max: 2078415.0}
+  peak_python_mib: 0.753
+  state_bytes_per_asset: 641
 dependencies: []                   # must be empty: dependencies ship in the image, never fetched
