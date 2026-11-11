@@ -23,6 +23,9 @@ log = logging.getLogger("algorithm_runtime")
 
 
 _UNSET = object()
+# Output kinds sent with a bytes key although unstamped (the element path sent
+# its window as `aid.encode()`).
+BYTES_KEY_KINDS = ("element_window",)
 
 
 def parse_envelope(raw: bytes) -> dict | None:
@@ -87,6 +90,7 @@ def _stamp_hash(unit, decl: Declaration) -> str:
 def process_one(unit, decl: Declaration, raw: bytes, state: dict | None,
                 record_time_ns: int | None = None, *,
                 window_rollup: Callable[[str], object] | None = None,
+                window_trends: Callable[[str], object] | None = None,
                 on_payload: Callable[[str, str, object], None] | None = None,
                 parsed=_UNSET):
     """Returns (new_state or None, [(topic, key_bytes, message)], counters).
@@ -99,7 +103,9 @@ def process_one(unit, decl: Declaration, raw: bytes, state: dict | None,
     `record_time_ns` role is present only when it is given, so a unit that
     requires the role skips (and counts) every record it is not given.
     `window_rollup(asset_id)` is the host's hook for a `window` output: it
-    returns the asset's element rollup, or None. `on_payload(asset_id, kind,
+    returns the asset's element rollup, or None. `window_trends(asset_id)` is
+    the host's hook for an `element_window` output: the last `window` payload
+    the trends unit emitted for the asset, or None. `on_payload(asset_id, kind,
     payload)` is called with each payload that built without refusal.
 
     State is copied one level (`dict(state)`), not deep: a durable unit's
@@ -195,6 +201,8 @@ def process_one(unit, decl: Declaration, raw: bytes, state: dict | None,
                 extra = {}
                 if kind == "window" and window_rollup is not None:
                     extra["rollup"] = window_rollup(asset_id)
+                if kind == "element_window":
+                    extra["window_trends"] = window_trends
                 evt_out = outputs.build_event(
                     evt, msg, out, unit=decl.unit, version=decl.version,
                     config_hash=stamp, tier=tier, raw=raw, params=unit.params, **extra,
@@ -205,6 +213,8 @@ def process_one(unit, decl: Declaration, raw: bytes, state: dict | None,
                 log.warning("%s: output refused for asset %s: %s", decl.unit, asset_id, exc)
                 counters["output_refused"] += 1
                 continue
-            # An unstamped output keeps its old send's str key.
-            sends.append((out.topic, asset_id if out.stamp == "none" else asset_id.encode(), evt_out))
+            # An unstamped output keeps its old send's key: a str, except the
+            # element window, which was always sent with bytes.
+            as_str = out.stamp == "none" and kind not in BYTES_KEY_KINDS
+            sends.append((out.topic, asset_id if as_str else asset_id.encode(), evt_out))
     return work, sends, counters

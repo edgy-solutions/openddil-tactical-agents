@@ -26,10 +26,27 @@ given in `slope_unit`, which the builder turns into `slope_unit + "/h"`
 through pint, so the strings on the wire are formatted as the original window
 path formatted them (`detection.windows`). The envelope (asset, labels,
 provenance, computed_at, the element rollup) is the contract's, as above.
+
+The `element_window` kind: the element path's WindowedTelemetry, from the
+element snapshot (a json-envelope input). The unit's payload is flat; the
+rollup counts and averages are required, the rest optional:
+
+    {"profile_name": str, "element_count": int, "critical_count": int,
+     "degraded_count": int, "avg_temp_c": number, "avg_load_pct": number,
+     "observed_at_ns": int or None,
+     "core_temp_c": number, "uptime_hours": number,      (only when numeric)
+     "condition": dict,    (the producer's block as it came; a malformed one is dropped)
+     "originator_nation": str, "releasable_to": [str], "platform_variant": str}
+
+The host adds the rest as the original element path did: the asset and the
+window span from the envelope, the trends the `trends` unit last emitted for
+the asset (from the `window_trends` hook), the wall clock, the origin node
+from the env, and the labels from the payload.
 """
 from __future__ import annotations
 
 import json
+import logging
 import os
 import time
 import uuid
@@ -46,8 +63,26 @@ from element_band_event import build_band_event
 from posture_event import build_transition_event
 
 
+log = logging.getLogger("algorithm_runtime")
+
+# The element path was the faust-edge agent; its window keeps that producer id
+# (the element_window kind is unstamped, so the declaration carries none).
+ELEMENT_WINDOW_PRODUCER = "faust-edge"
+
+
 class OutputError(ValueError):
     pass
+
+
+# The wall clock of the element window's `computed_at` and `ingest_time`;
+# a test or the replay sets it so two runs compare.
+_now_ns = time.time_ns
+
+
+def set_clock(fn=None) -> None:
+    """Replace the element window's clock (ns); None restores the wall clock."""
+    global _now_ns
+    _now_ns = fn or time.time_ns
 
 
 # The posture unit's lower-case state names <-> the proto enum. Lower-case
@@ -182,6 +217,55 @@ def _window_payload(payload: Mapping) -> winpb.WindowedTelemetry:
     return out
 
 
+def _is_count(v) -> bool:
+    return isinstance(v, int) and not isinstance(v, bool)
+
+
+def element_rollup_from_payload(payload: Mapping) -> winpb.ElementRollup:
+    """The ElementRollup an `element_window` payload states."""
+    try:
+        out = winpb.ElementRollup()
+        out.profile_name = payload["profile_name"]
+        for name in ("element_count", "critical_count", "degraded_count"):
+            if not _is_count(payload[name]):
+                raise TypeError(f"{name} is not an integer")
+            setattr(out, name, payload[name])
+        out.avg_temp_c = float(payload["avg_temp_c"])
+        out.avg_load_pct = float(payload["avg_load_pct"])
+        obs = payload.get("observed_at_ns")
+        if obs is not None:
+            out.observed_at.FromNanoseconds(obs)
+        for name in ("core_temp_c", "uptime_hours"):
+            if name in payload:
+                setattr(out, name, float(payload[name]))
+        cond = payload.get("condition")
+        if isinstance(cond, dict):
+            try:
+                json_format.ParseDict(cond, out.condition, ignore_unknown_fields=True)
+            except json_format.ParseError:
+                out.ClearField("condition")   # the counts are still true without it
+    except (KeyError, TypeError, ValueError, OverflowError, AttributeError) as exc:
+        raise OutputError(f"payload is not an element window: {exc!r}") from exc
+    return out
+
+
+def _element_window_payload(payload: Mapping) -> winpb.WindowedTelemetry:
+    out = winpb.WindowedTelemetry()
+    out.element_rollup.CopyFrom(element_rollup_from_payload(payload))
+    variant = payload.get("platform_variant") or ""
+    nation = payload.get("originator_nation") or ""
+    releasable = payload.get("releasable_to") or ()
+    if (not isinstance(variant, str) or not isinstance(nation, str)
+            or not isinstance(releasable, (list, tuple))
+            or not all(isinstance(r, str) for r in releasable)):
+        raise OutputError("payload is not an element window: labels or platform_variant are not strings")
+    out.platform_variant = variant
+    if nation:
+        out.provenance.originator_nation = nation
+    out.provenance.releasable_to.extend(releasable)
+    return out
+
+
 def build_payload(kind: str, payload: Mapping) -> pb.SustainmentMetrics | winpb.WindowedTelemetry | dict:
     """Typed message for one output kind (a dict for an anomaly: its wire
     form is JSON, not a proto)."""
@@ -189,6 +273,8 @@ def build_payload(kind: str, payload: Mapping) -> pb.SustainmentMetrics | winpb.
         return _anomaly_payload(payload)
     if kind == "window":
         return _window_payload(payload)
+    if kind == "element_window":
+        return _element_window_payload(payload)
     if kind == "latest_state":
         return _latest_state_payload(payload)
     if kind == "posture_transition":
@@ -235,6 +321,7 @@ def build_event(
     rollup: winpb.ElementRollup | None = None,
     raw: bytes | None = None,
     params: Mapping | None = None,
+    window_trends=None,
 ) -> pb.EntityTelemetryEvent | winpb.WindowedTelemetry | dict | bytes:
     """Build the output envelope. A sustainment output is a fresh EntityTelemetryEvent carrying only
     the derived sustainment + identity + provenance. No kinematics are
@@ -246,6 +333,8 @@ def build_event(
         return _transition_event(src, sustainment, tier)
     if out.kind == "band_crossing":
         return _band_event(src, sustainment, params or {}, tier)
+    if out.kind == "element_window":
+        return _element_window_event(src, sustainment, out, tier, window_trends)
     if out.kind == "anomaly":
         return _anomaly_event(src, sustainment, out, unit=unit, version=version,
                               config_hash=config_hash, tier=tier)
@@ -418,6 +507,48 @@ def _window_event(
     ev.provenance.producer_stamp.tier = tier
     if rollup is not None:
         ev.element_rollup.CopyFrom(rollup)
+    return ev
+
+
+def _element_window_event(env: dict, msg: winpb.WindowedTelemetry, out: OutputDecl, tier: str,
+                          window_trends) -> winpb.WindowedTelemetry:
+    """The element path's WindowedTelemetry, as it was built before the unit:
+    the window spans the snapshot's own observation instant (the clock when it
+    carried none), the sustainment trends are the `trends` unit's last window
+    for the asset as that unit emitted them (none yet: none, and a
+    sample_count of 0), `computed_at` and `ingest_time` are the clock, the
+    origin node is this tier and the env's region, the producer is the
+    declaration's, and the labels are the envelope's, with no default and no
+    producer stamp."""
+    from detection.windows import build_window_spec  # pint is slow to import
+    aid = env["asset_id"]
+    now_ns = _now_ns()
+    rollup = msg.element_rollup
+    obs_ns = rollup.observed_at.ToNanoseconds() if rollup.HasField("observed_at") else now_ns
+    ev = winpb.WindowedTelemetry()
+    trend_samples = 0
+    last = window_trends(aid) if window_trends is not None else None
+    if last is not None:
+        try:
+            ev.CopyFrom(build_payload("window", last))
+            trend_samples = int(last["sample_count"])
+        except (OutputError, KeyError) as exc:
+            log.warning("element window for %s: last trends payload unusable: %s", aid, exc)
+            ev = winpb.WindowedTelemetry()
+    ev.asset_id = aid
+    ev.platform_variant = msg.platform_variant
+    ev.computed_at.FromNanoseconds(now_ns)
+    ev.provenance.producer_id = ELEMENT_WINDOW_PRODUCER
+    ev.provenance.edge_id = tier
+    ev.provenance.region_id = os.getenv("OPENDDIL_REGION_ID", "region-01")
+    ev.provenance.ingest_time.FromNanoseconds(now_ns)
+    ev.provenance.classification = "U"
+    if msg.provenance.originator_nation:
+        ev.provenance.originator_nation = msg.provenance.originator_nation
+    ev.provenance.releasable_to.extend(msg.provenance.releasable_to)
+    ev.window.CopyFrom(build_window_spec(
+        window_start_ns=obs_ns, window_end_ns=obs_ns, sample_count=trend_samples))
+    ev.element_rollup.CopyFrom(rollup)
     return ev
 
 

@@ -31,7 +31,8 @@ API_VERSION = "openddil.io/algorithm/v1"
 RUNTIME = "stream-parallel"
 LABELS = "copy-source"
 # Output kind table. Each kind maps to an envelope field in outputs.py.
-OUTPUT_KINDS = ("sustainment", "anomaly", "window", "latest_state", "posture_transition", "band_crossing")
+OUTPUT_KINDS = ("sustainment", "anomaly", "window", "latest_state", "posture_transition", "band_crossing",
+                "element_window")
 # Output class. A `value` output is whatever the unit returns; a `transition`
 # output is one record per change of the named state field, and the host
 # drops the payload of a step in which that field did not change.
@@ -39,7 +40,7 @@ OUTPUT_CLASSES = ("value", "transition")
 # Producer stamp. `none` is for the kinds whose bytes or shape must stay what
 # they were before the unit existed (so they carry no producer fields either).
 STAMPS = ("producer", "none")
-UNSTAMPED_KINDS = ("latest_state", "posture_transition", "band_crossing")
+UNSTAMPED_KINDS = ("latest_state", "posture_transition", "band_crossing", "element_window")
 # An anomaly output names the CloudEvent type it emits and the severity the
 # contract stamps on it; the unit supplies neither.
 EVENT_TYPE = re.compile(r"^openddil\.anomaly\.[a-z0-9_.]+$")
@@ -52,7 +53,8 @@ DECLARED_PARAM_TYPES = PARAM_TYPES + ("bands",)
 # Input format. `protobuf` is an EntityTelemetryEvent; `json-envelope` is the
 # element snapshot's JSON envelope, whose gates the host applies before the step.
 INPUT_FORMATS = ("protobuf", "json-envelope")
-JSON_ENVELOPE_ROLES = ("observed_at_s", "elements")
+JSON_ENVELOPE_ROLES = ("observed_at_s", "elements", "element_values", "observed_at_ns",
+                       "profile_name", "operational", "envelope_labels", "platform_variant")
 # State persistence. `durable` is a Faust Table (RocksDB, changelog-replicated);
 # `memory` is a per-process dict, lost on a restart, for state a unit may
 # rebuild from the live feed. Only memory state may hold an `object` field.

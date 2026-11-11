@@ -143,10 +143,12 @@ class Wiring:
     in-line buffers did. A durable unit's state is the Table record the agent
     passes in."""
 
-    def __init__(self, unit: Unit, decl: declaration.Declaration, window_rollup, last_window: dict):
+    def __init__(self, unit: Unit, decl: declaration.Declaration, window_rollup, last_window: dict,
+                 last_rollup: dict | None = None):
         self.unit, self.decl = unit, decl
         self.window_rollup = window_rollup
         self.last_window = last_window
+        self.last_rollup = last_rollup if last_rollup is not None else {}
         self.memory: dict[str, dict] = {}
         self.counters: dict = {}
         # Memory-persistence fields of a durable unit: asset_id -> {field: value}.
@@ -156,6 +158,8 @@ class Wiring:
     def _remember(self, asset_id: str, kind: str, payload) -> None:
         if kind == "window":
             self.last_window[asset_id] = payload
+        elif kind == "element_window":
+            self.last_rollup[asset_id] = outputs.element_rollup_from_payload(payload)
 
     def process(self, raw: bytes, record_time_ns: int | None, state: dict | None = None):
         """(new_state or None, sends). `state` is the durable record's fields
@@ -181,7 +185,7 @@ class Wiring:
             state = {**state, **held}
         new_state, sends, new_counters = core.process_one(
             self.unit, self.decl, raw, state, record_time_ns,
-            window_rollup=self.window_rollup, on_payload=self._remember, **extra)
+            window_rollup=self.window_rollup, window_trends=self.last_window.get, on_payload=self._remember, **extra)
         _count(self.counters, new_counters)
         if memory and new_state is not None:
             self.memory[asset] = new_state
@@ -198,11 +202,19 @@ class Runner:
     def __init__(self):
         self.wirings: dict[str, Wiring] = {}
         self._last_window: dict[str, dict] = {}
+        # The latest element rollup per asset, kept from each `element_window`
+        # output. In memory, per process: a restart starts it empty.
+        self._last_rollup: dict[str, object] = {}
 
     def last_window(self, asset_id: str):
         """The last `window` payload (the unit's dict) emitted for the asset,
         or None. The element path builds its window from it."""
         return self._last_window.get(asset_id)
+
+    def last_rollup(self, asset_id: str):
+        """The element rollup (a winpb.ElementRollup) of the last `element_window`
+        emitted for the asset, or None. A `window` output attaches it."""
+        return self._last_rollup.get(asset_id)
 
 
 def record_time_ns(message) -> int | None:
@@ -221,7 +233,8 @@ def register(app: faust.App, window_rollup=None) -> Runner:
     call on the same app would register duplicate agents and tables.
 
     `window_rollup(asset_id)` is the host's hook for `window` outputs: it
-    returns the element rollup to attach, or None. Returns the `Runner`."""
+    returns the element rollup to attach, or None. It defaults to the runner's
+    own store, which the `element_window` outputs fill. Returns the `Runner`."""
     enabled_raw = os.environ.get("ALGORITHMS_ENABLED", "").strip()
     if not enabled_raw:
         raise StartupRefusal(
@@ -280,6 +293,8 @@ def register(app: faust.App, window_rollup=None) -> Runner:
     _refuse_unrunnable(loaded)
 
     runner = Runner()
+    if window_rollup is None:
+        window_rollup = runner._last_rollup.get
     for decl, unit, params in loaded:
         _wire(app, decl, unit, params, runner, window_rollup)
     return runner
@@ -308,7 +323,7 @@ def _wire(app: faust.App, decl: declaration.Declaration, unit: Unit, params: dic
         decl.unit, decl.version, declaration.config_hash(decl.unit, decl.version, params), params,
         decl.state_persistence,
     )
-    wiring = Wiring(unit, decl, window_rollup, runner._last_window)
+    wiring = Wiring(unit, decl, window_rollup, runner._last_window, runner._last_rollup)
     runner.wirings[decl.unit] = wiring
     names = [f.name for f in decl.state_fields if f.persistence != "memory"]
 

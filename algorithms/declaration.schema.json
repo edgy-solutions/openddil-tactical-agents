@@ -29,7 +29,7 @@
             "additionalProperties": false,
             "required": ["role"],
             "properties": {
-              "role": {"enum": ["position_ecef_m", "pitch_deg", "roll_deg", "sample_time_ns", "component_temp_k", "ambient_temp_k", "record_time_ns", "fuel_remaining", "consumables", "wear_hours", "wear_rul", "active_fault_codes", "deploy_signal", "speed_mps", "sample_time_s", "observed_at_s", "elements"]},
+              "role": {"enum": ["position_ecef_m", "pitch_deg", "roll_deg", "sample_time_ns", "component_temp_k", "ambient_temp_k", "record_time_ns", "fuel_remaining", "consumables", "wear_hours", "wear_rul", "active_fault_codes", "deploy_signal", "speed_mps", "sample_time_s", "observed_at_s", "elements", "element_values", "observed_at_ns", "profile_name", "operational", "envelope_labels", "platform_variant"]},
               "required": {"type": "boolean"}
             }
           }
@@ -83,7 +83,7 @@
         "additionalProperties": false,
         "required": ["kind", "topic", "direction", "labels"],
         "properties": {
-          "kind": {"enum": ["sustainment", "anomaly", "window", "latest_state", "posture_transition", "band_crossing"]},
+          "kind": {"enum": ["sustainment", "anomaly", "window", "latest_state", "posture_transition", "band_crossing", "element_window"]},
           "many": {"type": "boolean"},
           "class": {"enum": ["value", "transition"]},
           "on_change_of": {"type": "string", "minLength": 1},
@@ -103,7 +103,7 @@
             "else": {"not": {"anyOf": [{"required": ["event_type"]}, {"required": ["severity"]}]}}
           },
           {
-            "if": {"properties": {"kind": {"enum": ["latest_state", "posture_transition", "band_crossing"]}}, "required": ["kind"]},
+            "if": {"properties": {"kind": {"enum": ["latest_state", "posture_transition", "band_crossing", "element_window"]}}, "required": ["kind"]},
             "then": {
               "required": ["stamp"],
               "properties": {"stamp": {"const": "none"}},

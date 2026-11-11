@@ -61,6 +61,20 @@ ROLES: dict[str, str] = {
     # filtered, so the unit applies its own numeric rule.
     "observed_at_s": "float",
     "elements": "tuple[tuple[str, str, dict], ...]",
+    # The element rollup's inputs, also from the gated envelope, each extracted
+    # only when the unit names it. `element_values` is a tuple of a shallow
+    # copy of every entry of `elements`, in order and unfiltered (an entry with
+    # no id counts). `observed_at_ns` is int(observed_at_ns) when that is a
+    # number and not a bool, else None. `profile_name` is the envelope's or "".
+    # `operational` is a deep copy of the envelope's block, {} when absent.
+    # `envelope_labels` is (originator_nation str or "", the str members of
+    # releasable_to, empty when it is not a list). `platform_variant` is a str.
+    "element_values": "tuple[dict, ...]",
+    "observed_at_ns": "int | None",
+    "profile_name": "str",
+    "operational": "dict",
+    "envelope_labels": "tuple[str, tuple[str, ...]]",
+    "platform_variant": "str",
 }
 
 

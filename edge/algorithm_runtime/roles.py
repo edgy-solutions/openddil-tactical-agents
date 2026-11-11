@@ -4,6 +4,7 @@ The proto traversal lives here so a unit sees plain numbers under the names
 in `contract.ROLES` and never a message type."""
 from __future__ import annotations
 
+import copy
 import math
 import time
 
@@ -70,6 +71,25 @@ def extract_envelope(env: dict, wanted=None) -> dict:
                 continue
             found.append((path, el.get("layer_name") or "", dict(el)))
         out["elements"] = tuple(found)
+    if wanted is None or "element_values" in wanted:
+        out["element_values"] = tuple(dict(el) for el in env.get("elements") or ())
+    if wanted is None or "observed_at_ns" in wanted:
+        obs_ns = env.get("observed_at_ns")
+        out["observed_at_ns"] = int(obs_ns) if _is_json_number(obs_ns) else None
+    if wanted is None or "profile_name" in wanted:
+        out["profile_name"] = env.get("profile_name") or ""
+    if wanted is None or "operational" in wanted:
+        out["operational"] = copy.deepcopy(env.get("operational") or {})
+    if wanted is None or "envelope_labels" in wanted:
+        nation = env.get("originator_nation") or ""
+        releasable = env.get("releasable_to") or []
+        if not isinstance(releasable, list):
+            releasable = []
+        out["envelope_labels"] = (
+            nation if isinstance(nation, str) else "",
+            tuple(r for r in releasable if isinstance(r, str)))
+    if wanted is None or "platform_variant" in wanted:
+        out["platform_variant"] = env.get("platform_variant") or ""
     return out
 
 
