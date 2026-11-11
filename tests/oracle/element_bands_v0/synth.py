@@ -86,3 +86,50 @@ def make(seed: int):
         return json.dumps(env).encode("utf-8")
 
     return fill
+
+
+# --- the element rollup's extra fields --------------------------------------------------
+_LEVELS = ("CONDITION_LEVEL_NOMINAL", "CONDITION_LEVEL_DEGRADED", "CONDITION_LEVEL_CRITICAL")
+_SOURCES = ("CONDITION_SOURCE_APPEARANCE_POWER", "CONDITION_SOURCE_EMISSION", "CONDITION_SOURCE_DATA_HEALTH")
+_VARIANTS = ("", "v1", "v2")
+
+
+def make_extended(seed: int):
+    """`make(seed)` plus what the element rollup reads: an `operational` block
+    (core_temp_c and uptime_hours, each sometimes missing or not a number), a
+    `condition` block (sometimes malformed), a platform_variant, and now and
+    then an element with no `element_id`. The base envelope is `make(seed)`'s,
+    unchanged, and the extras come from their own generator (seeded from `seed`
+    but separate), so adding them moves nothing `make` produces."""
+    base = make(seed)
+    rng = random.Random(seed * 7919 + 104729)
+
+    def fill(ts_ms: int, asset_id: str) -> bytes:
+        env = json.loads(base(ts_ms, asset_id))
+        op = {}
+        if rng.random() < 0.8:
+            op["core_temp_c"] = 55.0 + rng.uniform(-10.0, 25.0)
+        if rng.random() < 0.8:
+            op["uptime_hours"] = rng.uniform(1.0, 900.0)
+        if rng.random() < 0.05:
+            op["core_temp_c"] = "hot"                       # present, not a number
+        if rng.random() < 0.3:
+            roll = rng.random()
+            if roll < 0.75:
+                op["condition"] = {
+                    "level": rng.choice(_LEVELS), "moved_by": [rng.choice(_SOURCES)],
+                    "claims": [{"source": rng.choice(_SOURCES), "level": rng.choice(_LEVELS),
+                                "detail": "synthetic"}]}
+            elif roll < 0.9:
+                op["condition"] = {"level": {"not": "a level"}}     # malformed: dropped
+            else:
+                op["condition"] = "red"                             # not a block at all
+        if rng.random() < 0.9:
+            env["operational"] = op
+        env["platform_variant"] = rng.choice(_VARIANTS)
+        if rng.random() < 0.1:
+            env["elements"].append({"layer_name": "ORPHAN", "health": rng.uniform(0.3, 0.99),
+                                    "temp_c": 41.0, "load_pct": 50.0})
+        return json.dumps(env).encode("utf-8")
+
+    return fill

@@ -87,3 +87,23 @@ def make_element_bands(overrides=None):
     sys.modules[name] = module
     spec.loader.exec_module(module)
     return module.ElementBands(declaration.resolve_params(decl, overrides)), decl
+
+
+ROLLUP_DIR = ROOT / "algorithms" / "element_rollup"
+
+
+def rollup_decl() -> declaration.Declaration:
+    return declaration.load(ROLLUP_DIR / "unit.yaml")
+
+
+def make_element_rollup(overrides=None):
+    """(unit, decl) for the element_rollup unit, loaded by file under the guard
+    as the runner does, with `overrides` applied to its declared defaults."""
+    decl = rollup_decl()
+    guard.check_unit_dir(ROLLUP_DIR)
+    name = "openddil_algorithms.element_rollup"
+    spec = importlib.util.spec_from_file_location(name, ROLLUP_DIR / "element_rollup_unit.py")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module.ElementRollup(declaration.resolve_params(decl, overrides)), decl

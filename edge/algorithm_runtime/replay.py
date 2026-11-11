@@ -57,9 +57,10 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Iterable, Iterator, Mapping
 
+from openddil.logistics.v1 import windowed_telemetry_pb2 as winpb
 from openddil.telemetry.v1 import telemetry_pb2 as pb
 
-from algorithm_runtime import core, declaration, guard, loader, roles
+from algorithm_runtime import core, declaration, guard, loader, outputs, roles
 from algorithm_runtime.contract import Unit
 from algorithm_runtime.declaration import Declaration
 
@@ -786,9 +787,22 @@ def _stamp_of(msg):
     return (ps.unit, ps.version, ps.config_hash, ps.tier)
 
 
+def _clear_window_clock(msg):
+    out = winpb.WindowedTelemetry()
+    out.CopyFrom(msg)
+    out.ClearField("computed_at")
+    out.provenance.ClearField("ingest_time")
+    return out
+
+
 def _wire(msg):
     """An unstamped kind as it goes on the wire: bytes as they are, a CloudEvent
-    dict through one JSON round trip (the encoding the send does)."""
+    dict through one JSON round trip (the encoding the send does). A
+    WindowedTelemetry is its serialized bytes with the host wall clock cleared
+    (`computed_at` and `provenance.ingest_time`, the only fields that read it
+    once the replay holds "now" fixed): everything else is compared exactly."""
+    if isinstance(msg, winpb.WindowedTelemetry):
+        return _clear_window_clock(msg).SerializeToString(deterministic=True)
     return json.loads(json.dumps(msg)) if isinstance(msg, dict) else msg
 
 
@@ -844,6 +858,12 @@ def compare_oracle(unit, decl, params, raw_records, env, name: str, synth_seed: 
             else:
                 os.environ.pop(k, None)
         oracle = pkg.Oracle(params, tier, env.get("OPENDDIL_REGION_ID", ""))
+        # "Now" is the record's own time on both sides, so an output that falls
+        # back to the clock (the element window with no observed_at) compares.
+        now_cell = [0]
+        outputs.set_clock(lambda: now_cell[0])
+        if hasattr(oracle, "set_clock"):
+            oracle.set_clock(lambda: now_cell[0])
         normalize = getattr(pkg, "normalize", lambda _kind, m: m)
         fill = None
         envelope_in = decl.input_format == "json-envelope"
@@ -881,7 +901,10 @@ def compare_oracle(unit, decl, params, raw_records, env, name: str, synth_seed: 
                     r.equal += 1
                     continue
                 r.different += 1
-                paths = _diff_any(a, b)
+                if isinstance(o_msg, winpb.WindowedTelemetry) and isinstance(n_msg, winpb.WindowedTelemetry):
+                    paths = _diff_paths(_clear_window_clock(o_msg), _clear_window_clock(n_msg)) or ["<bytes>"]
+                else:
+                    paths = _diff_any(a, b)
                 diff_fields.update(re.sub(r"\[\d+\]", "[]", p) for p in paths)
                 if len(r.first_diffs) < _MAX_FIRST_DIFFS:
                     r.first_diffs.append({"kind": key[1], "old_record": o_no, "new_record": n_no, "paths": paths})
@@ -910,6 +933,7 @@ def compare_oracle(unit, decl, params, raw_records, env, name: str, synth_seed: 
                     fill(evt)
                     value = evt.SerializeToString()
             rt_ns = ts_ms * 1_000_000
+            now_cell[0] = rt_ns
             if not envelope_in:
                 try:
                     probe = pb.EntityTelemetryEvent()
@@ -956,6 +980,7 @@ def compare_oracle(unit, decl, params, raw_records, env, name: str, synth_seed: 
             timing.update(spent)
         return r
     finally:
+        outputs.set_clock(None)
         for k, v in saved.items():
             if v is None:
                 os.environ.pop(k, None)
