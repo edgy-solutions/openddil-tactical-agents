@@ -287,3 +287,69 @@ def test_ignored_inputs_through_the_unit():
     assert _band_path(rig, [99.0], field="temp_c") == []
     # ignored values did not set a band: the next numeric is still the first observation
     assert _band_path(rig, [0.99]) == []
+
+
+# --recorded-envelopes: the element topic's own records (second lab, asset-element-telemetry),
+# compared through the CLI with no synth.
+def _envelope_file(tmp_path, values, topic="asset-element-telemetry"):
+    import base64
+    import gzip
+    d = tmp_path / "rec"
+    d.mkdir()
+    path = d / f"{topic}.100-{100 + len(values) - 1}.gz"
+    with gzip.open(path, "wb") as fh:
+        for i, v in enumerate(values):
+            fh.write(b" ".join([str(100 + i).encode(), str(1_000_000 + i * 2000).encode(),
+                                base64.b64encode(b"k"), base64.b64encode(v)]) + b"\n")
+    return str(d / f"{topic}.*.gz")
+
+
+def _cli(tmp_path, glob, *extra, unit_dir=BANDS_DIR, name="element_bands"):
+    return replay.main(["--unit-dir", str(unit_dir), "--edge-id", EDGE, "--region-id", REGION,
+                        "--raw", glob, "--out", str(tmp_path / "cmp.json"), "--compare-oracle", name, *extra])
+
+
+def _envs(n=40):
+    return [raw(envelope(asset=ASSETS[i % 3], t_s=i + 1, elements=els(0.5 if i % 6 < 3 else 0.99)))
+            for i in range(n)]
+
+
+def test_the_cli_compares_recorded_envelopes(tmp_path, capsys):
+    assert _cli(tmp_path, _envelope_file(tmp_path, _envs()), "--recorded-envelopes") == 0
+    rep = json.loads((tmp_path / "cmp.json").read_text(encoding="utf-8"))
+    assert rep["compared"] == rep["equal"] > 0 and rep["assets"] == 3
+    assert "COMPARE-ORACLE" in capsys.readouterr().out
+
+
+def test_the_cli_still_refuses_an_envelope_unit_with_neither_input(tmp_path, capsys):
+    assert _cli(tmp_path, _envelope_file(tmp_path, _envs())) == 2
+    assert "--synth-seed is required (or --recorded-envelopes" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("extra, why", [
+    (("--synth-seed", "1"), "different inputs"),
+])
+def test_recorded_envelopes_refuses_a_synth_seed(tmp_path, capsys, extra, why):
+    assert _cli(tmp_path, _envelope_file(tmp_path, _envs()), "--recorded-envelopes", *extra) == 2
+    assert why in capsys.readouterr().err
+
+
+def test_recorded_envelopes_needs_compare_oracle_and_an_envelope_unit(tmp_path, capsys):
+    from unit_helpers import POSTURE_DIR
+    glob = _envelope_file(tmp_path, _envs())
+    assert _cli(tmp_path, glob, "--recorded-envelopes", unit_dir=POSTURE_DIR, name="posture") == 2
+    rc = replay.main(["--unit-dir", str(BANDS_DIR), "--edge-id", EDGE, "--region-id", REGION,
+                      "--raw", glob, "--out", str(tmp_path / "x.json"), "--recorded-envelopes"])
+    assert rc == 2
+    assert capsys.readouterr().err.count("needs --compare-oracle and a json-envelope unit") == 2
+    assert not (tmp_path / "x.json").exists()
+
+
+def test_recorded_envelopes_refuses_a_record_that_is_not_one(tmp_path, capsys):
+    # A raw-sensor-stream record (protobuf) where an envelope should be: refused, not compared as nothing.
+    e = pb.EntityTelemetryEvent()
+    e.asset.asset_id = "asset-a"
+    vals = _envs(5) + [e.SerializeToString()]
+    assert _cli(tmp_path, _envelope_file(tmp_path, vals), "--recorded-envelopes") == 2
+    assert "record 6 (offset 105): not a JSON object" in capsys.readouterr().err
+    assert not (tmp_path / "cmp.json").exists()

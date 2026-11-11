@@ -834,7 +834,7 @@ def _load_oracle(name: str):
 
 
 def compare_oracle(unit, decl, params, raw_records, env, name: str, synth_seed: int | None = None,
-                   timing: dict | None = None) -> OracleReport:
+                   timing: dict | None = None, recorded_envelopes: bool = False) -> OracleReport:
     """Run the frozen oracle `<name>_v0` and `unit` over the same raw records.
 
     The oracle package offers `Oracle(params, edge_id, region_id)` with
@@ -843,7 +843,9 @@ def compare_oracle(unit, decl, params, raw_records, env, name: str, synth_seed: 
     cold and see every record in order with the same record time; the unit's
     state is kept per asset between records as the runner keeps it. Outputs
     are paired in order per (asset, kind). `timing`, if given, receives the
-    seconds spent in each side."""
+    seconds spent in each side. `recorded_envelopes` says the records are a
+    json-envelope topic's own: a value that is not a JSON object is refused,
+    so a recording of another topic cannot compare nothing and pass."""
     import time as _time
     tier = env.get("OPENDDIL_EDGE_ID", "")
     if not tier:
@@ -922,6 +924,9 @@ def compare_oracle(unit, decl, params, raw_records, env, name: str, synth_seed: 
                     except Exception:  # noqa: BLE001 - not a telemetry record: no pair
                         continue
                     value = fill(ts_ms, evt.asset.asset_id)
+                elif recorded_envelopes and core.parse_envelope(value) is None:
+                    raise ReplayInputError(f"record {n} (offset {_offset}): not a JSON object; "
+                                           "--recorded-envelopes reads the envelope topic's own records")
                 asset_id = core.envelope_asset(value)
             elif fill is not None:
                 evt = pb.EntityTelemetryEvent()
@@ -1249,6 +1254,9 @@ def main(argv=None) -> int:
     ap.add_argument("--synth-seed", type=int,
                     help="with --compare-oracle: fill values the recording lacks, from the oracle package's synth "
                          "(with --measure the seed defaults to 0)")
+    ap.add_argument("--recorded-envelopes", action="store_true",
+                    help="with --compare-oracle on a json-envelope unit: the --raw files are that input topic's "
+                         "own records, so each value is an envelope (no synth)")
     ap.add_argument("--measure", action="store_true",
                     help="run the unit alone over the recording and report its memory and per-sample time")
     ap.add_argument("--synth", metavar="NAME",
@@ -1284,14 +1292,20 @@ def main(argv=None) -> int:
             raise ReplayInputError("--synth needs --measure")
         if args.synth_seed is not None and not args.compare_oracle:
             raise ReplayInputError("--synth-seed needs --compare-oracle (or --measure)")
-        if args.compare_oracle and decl.input_format == "json-envelope" and args.synth_seed is None:
-            raise ReplayInputError("a json-envelope unit's recording holds no envelopes: --synth-seed is required")
+        if args.recorded_envelopes:
+            if not args.compare_oracle or decl.input_format != "json-envelope":
+                raise ReplayInputError("--recorded-envelopes needs --compare-oracle and a json-envelope unit")
+            if args.synth_seed is not None:
+                raise ReplayInputError("--recorded-envelopes and --synth-seed are different inputs")
+        elif args.compare_oracle and decl.input_format == "json-envelope" and args.synth_seed is None:
+            raise ReplayInputError("a json-envelope unit's recording holds no envelopes: --synth-seed is required "
+                                   "(or --recorded-envelopes, when it is the envelope topic's own records)")
         if args.compare_oracle:
             timing: dict = {}
             orep = compare_oracle(
                 unit, decl, params, read_records(raw),
                 {"OPENDDIL_EDGE_ID": args.edge_id, "OPENDDIL_REGION_ID": args.region_id},
-                args.compare_oracle, args.synth_seed, timing)
+                args.compare_oracle, args.synth_seed, timing, args.recorded_envelopes)
             Path(args.out).write_text(orep.to_json(), encoding="utf-8")
             print("\n".join(_oracle_summary(orep, args.out, timing)))
             bad = orep.different or orep.old_only or orep.new_only or orep.stamp_failures
