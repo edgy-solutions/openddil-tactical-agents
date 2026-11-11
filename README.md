@@ -62,7 +62,7 @@ been there the whole time; adding the second Table just made it visible.
   recreates it with the new count.
 
 Both current Tables (`asset_state` in `edge/faust_edge.py` and
-`prognostics_accumulators` in `edge/prognostics/agent.py`) point back to
+`prognostics_accumulators`, declared in `algorithms/wear/unit.yaml` and built by `edge/algorithm_runtime/runner.py`) point back to
 this section in their inline comments.
 
 ## Changelog lag is NOT table-recovery state (READ BEFORE FILING A BUG)

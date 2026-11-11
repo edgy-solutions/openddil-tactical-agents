@@ -18,6 +18,8 @@ permissions:
 # AND additionally under :<tag-name> on a v* tag push.
 # `${{ github.repository_owner }}` resolves to `edgy-solutions` for this repo.
 # The openddil-demo base compose references each of these images directly.
+# A pull request builds every image and publishes none: :latest moves only on
+# a push to master, so an unmerged branch never reaches a cluster that pulls it.
 
 jobs:
   # The Hero-scenario edge agent referenced by openddil-demo/docker-compose.yml
@@ -54,7 +56,7 @@ jobs:
         with:
           context: ./edge
           file: ./edge/Dockerfile
-          push: true
+          push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.tags.outputs.tags }}
 
   # Legacy Faust detector (separate codepath from the Hero faust_edge agent
@@ -91,7 +93,7 @@ jobs:
         with:
           context: .
           file: ./edge/faust/Dockerfile
-          push: true
+          push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.tags.outputs.tags }}
           target: production
 
@@ -127,7 +129,7 @@ jobs:
         with:
           context: .
           file: ./edge/restate/Dockerfile
-          push: true
+          push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.tags.outputs.tags }}
           target: production
 
@@ -164,7 +166,7 @@ jobs:
         with:
           context: .
           file: ./hub/projector/Dockerfile
-          push: true
+          push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.tags.outputs.tags }}
           target: production
 
@@ -206,5 +208,5 @@ jobs:
         with:
           context: ./regional
           file: ./regional/Dockerfile
-          push: true
+          push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.tags.outputs.tags }}

@@ -127,7 +127,6 @@ def test_one_send_per_transition():
         mp.setattr(faust_edge, "state_topic", st_t)
         mp.setattr(faust_edge, "windows_topic", win_t)
         mp.setattr(faust_edge, "asset_state", defaultdict(faust_edge.StateRecord))
-        mp.setattr(faust_edge, "REGISTERED", [])
         asyncio.run(faust_edge.process.fun(stream()))
     finally:
         mp.undo()

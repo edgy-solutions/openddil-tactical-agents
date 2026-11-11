@@ -47,3 +47,18 @@ jobs:
         env:
           PYTHONPATH: ${{ github.workspace }}/openddil-contracts/gen/python
         run: cd regional && python -m pytest -q
+      # Needs the contracts commit that adds Provenance.producer_stamp; until
+      # that is pushed, the checkout above has no such field and this step
+      # fails by design (the runner refuses to start without it).
+      - name: algorithm runtime, wear unit and equivalence
+        env:
+          PYTHONPATH: ${{ github.workspace }}/openddil-contracts/gen/python
+        run: |
+          pip install jsonschema
+          python -m pytest -q tests
+      # The offline replay harness, on synthetic recordings with the frozen
+      # oracle playing production (includes the 200k-record memory bound).
+      - name: replay harness
+        env:
+          PYTHONPATH: ${{ github.workspace }}/openddil-contracts/gen/python
+        run: python -m pytest -q tests/test_replay.py

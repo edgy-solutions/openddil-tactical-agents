@@ -30,7 +30,8 @@ SEND = {"send", "send_and_wait"}
 ANNOTATION = re.compile(r"#\s*produces:\s*(.+?)\s*$")
 
 EDGE_ENV = {"FAUST_APP_ID": "openddil-edge-tst", "OPENDDIL_EDGE_ID": "edge-tst",
-            "OPENDDIL_REGION_ID": "region-tst"}
+            "OPENDDIL_REGION_ID": "region-tst",
+            "ALGORITHMS_ENABLED": "wear,thermal", "ALGORITHMS_DIR": str(ROOT / "algorithms")}
 REGIONAL_ENV = {"OPENDDIL_REGION_ID": "region-tst",
                 "REGIONAL_EDGES": "edge-tst=redpanda-edge-tst:9092"}
 # Variables the manifests read that the fixture must leave unset so defaults apply.
@@ -59,6 +60,10 @@ def _load_entrypoint(image, monkeypatch):
     for k, v in env.items():
         monkeypatch.setenv(k, v)
     monkeypatch.syspath_prepend(str(root))
+    for n in [m for m in sys.modules if m == "algorithm_runtime" or m.startswith("algorithm_runtime.")]:
+        # other tests import the runner first; a cached module is not "new" and
+        # its send site would escape the scan below
+        monkeypatch.delitem(sys.modules, n)
     before = set(sys.modules)
     topic_names = {}
     orig_topic = faust.App.topic
@@ -145,9 +150,9 @@ def _scan(path, topic_names, factory_kwargs, env):
                 and node.func.attr in SEND):
             continue
         span = lines[node.lineno - 1:node.end_lineno]
-        note = next((m.group(1).strip("\"'") for m in map(ANNOTATION.search, span) if m), None)
-        if note:
-            names.add(pm.expand(note, env))
+        notes = [m.group(1).strip("\"'") for m in map(ANNOTATION.search, span) if m]
+        if notes:  # a dynamic site names every topic it can write, one note per line
+            names |= {pm.expand(n, env) for n in notes}
             continue
         kw = {k.arg: k.value for k in node.keywords}
         got = None
@@ -188,6 +193,22 @@ def test_code_produces_exactly_the_manifest(image, monkeypatch):
     msg = [f"manifest lists a topic the code does not produce: {t}" for t in sorted(declared - got)]
     msg += [f"code produces a topic the manifest does not list: {t}" for t in sorted(got - declared)]
     assert not msg, f"{image}\n" + "\n".join(msg)
+
+
+def test_declared_unit_outputs_and_changelogs_are_in_the_manifest(monkeypatch):
+    """The runner's send site is dynamic (annotated); this ties what each
+    declaration says the unit writes to the manifest, so a declaration edit
+    cannot add an output the manifest does not list."""
+    from algorithm_runtime import declaration
+    env = EDGE_ENV
+    declared = {pm.expand(t, env) for t in MANIFEST["faust-edge"]["topics"]}
+    for unit_dir in sorted((ROOT / "algorithms").iterdir()):
+        if not (unit_dir / "unit.yaml").is_file():
+            continue
+        decl = declaration.load(unit_dir / "unit.yaml")
+        for out in decl.outputs:
+            assert out.topic in declared, f"{decl.unit}: output {out.topic} not in produces.yaml"
+        assert pm.expand("${FAUST_APP_ID:-openddil-edge}-" + decl.state_table + "-changelog", env) in declared
 
 
 def test_manifest_covers_exactly_both_images():

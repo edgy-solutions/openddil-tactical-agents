@@ -1,3 +1,5 @@
+# FROZEN: copied verbatim from edge/detection/algorithms.py at the parent commit (8ab3148), test oracle only.
+# The oracle for test_thermal_equivalence.py, never edited. Only these header lines were added.
 """
 Framework-agnostic anomaly detection.
 
