@@ -61,7 +61,7 @@ jobs:
         env:
           PYTHONPATH: ${{ github.workspace }}/openddil-contracts/gen/python
           OPENDDIL_EDGE_ID: edge-test
-          ALGORITHMS_ENABLED: wear,thermal,trends,posture,element_bands
+          ALGORITHMS_ENABLED: wear,thermal,trends,posture,element_bands,element_rollup
           ALGORITHMS_DIR: ${{ github.workspace }}/algorithms
           ALGORITHMS_MEMORY_LIMIT_MI: "1024"
           ALGORITHMS_CPU_LIMIT_M: "1000"

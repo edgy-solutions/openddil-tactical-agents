@@ -31,7 +31,7 @@ ANNOTATION = re.compile(r"#\s*produces:\s*(.+?)\s*$")
 
 EDGE_ENV = {"FAUST_APP_ID": "openddil-edge-tst", "OPENDDIL_EDGE_ID": "edge-tst",
             "OPENDDIL_REGION_ID": "region-tst",
-            "ALGORITHMS_ENABLED": "wear,thermal,trends,posture,element_bands", "ALGORITHMS_DIR": str(ROOT / "algorithms"),
+            "ALGORITHMS_ENABLED": "wear,thermal,trends,posture,element_bands,element_rollup", "ALGORITHMS_DIR": str(ROOT / "algorithms"),
             "ALGORITHMS_MEMORY_LIMIT_MI": "1024", "ALGORITHMS_CPU_LIMIT_M": "1000"}
 REGIONAL_ENV = {"OPENDDIL_REGION_ID": "region-tst",
                 "REGIONAL_EDGES": "edge-tst=redpanda-edge-tst:9092"}

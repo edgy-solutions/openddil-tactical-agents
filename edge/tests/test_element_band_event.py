@@ -1,16 +1,14 @@
 """
-Tests for element band events: the event builder (edge/element_band_event.py),
-and the faust_edge element path (which no longer
-sends band events: the element_bands unit does, see tests/test_element_bands_equivalence.py). No broker: the agent's coroutine is driven with a fake
-stream and fake topics.
+Tests for the element band event builder (edge/element_band_event.py). The
+agent that used to send these from faust_edge is gone: the element_bands unit
+sends them (tests/test_element_bands_equivalence.py) and the element_rollup
+unit sends the element window (tests/test_element_rollup_equivalence.py).
 
 Run with: py -3 -m pytest edge/tests/test_element_band_event.py -q
 (contracts gen/python on PYTHONPATH)
 """
 from __future__ import annotations
 
-import asyncio
-import json
 import sys
 from pathlib import Path
 
@@ -57,45 +55,3 @@ def test_labels_absent():
 def test_same_band_raises():
     with pytest.raises(ValueError):
         _ev(frm="ok", to="ok")
-
-
-# Wiring: drive the real `process_elements` agent body with fake topics.
-class _Fake:
-    def __init__(self):
-        self.sent = []
-
-    async def send(self, key=None, value=None, **kw):
-        self.sent.append((key, value))
-
-
-def _run(envs):
-    import faust_edge
-    ev_t, win_t = _Fake(), _Fake()
-
-    async def stream():
-        for e in envs:
-            yield json.dumps(e).encode()
-
-    mp = pytest.MonkeyPatch()
-    try:
-        mp.setattr(faust_edge, "events_topic", ev_t)
-        mp.setattr(faust_edge, "windows_topic", win_t)
-        asyncio.run(faust_edge.process_elements.fun(stream()))
-    finally:
-        mp.undo()
-    return ev_t, win_t
-
-
-def _env(t_s, health):
-    return {
-        "asset_id": "a1", "profile_name": "p",
-        "observed_at_ns": int(t_s * 1e9),
-        "originator_nation": "ATL", "releasable_to": ["BDR"],
-        "elements": [{"element_id": "e1", "layer_name": "psu", "health": health}],
-    }
-
-
-def test_element_path_sends_windows_and_no_band_events():
-    ev_t, win_t = _run([_env(1, 0.5), _env(2, 0.99)])
-    assert ev_t.sent == []              # crossings come from the element_bands unit
-    assert len(win_t.sent) == 2         # the rollup path is untouched
