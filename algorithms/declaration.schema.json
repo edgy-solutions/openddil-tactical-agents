@@ -1,0 +1,140 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://openddil.io/algorithm/v1/declaration.schema.json",
+  "title": "Algorithm unit declaration, openddil.io/algorithm/v1",
+  "description": "Mirrors edge/algorithm_runtime/declaration.py. One rule is not expressible here: a param default must lie within its own minimum/maximum, which the runtime validator enforces.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["apiVersion", "unit", "version", "runtime", "entrypoint", "key", "composition", "inputs", "params", "state", "outputs", "resources"],
+  "properties": {
+    "apiVersion": {"const": "openddil.io/algorithm/v1"},
+    "unit": {"type": "string", "pattern": "^[a-z][a-z0-9_]*$"},
+    "version": {"type": "string", "minLength": 1},
+    "runtime": {"const": "stream-parallel"},
+    "entrypoint": {"type": "string", "pattern": "^[^:]+:[^:]+$"},
+    "key": {"const": "asset_id"},
+    "composition": {"enum": ["propagating", "terminal"]},
+    "inputs": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["topic", "roles"],
+      "properties": {
+        "topic": {"type": "string", "minLength": 1},
+        "roles": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["role"],
+            "properties": {
+              "role": {"enum": ["position_ecef_m", "pitch_deg", "roll_deg", "sample_time_ns", "component_temp_k", "ambient_temp_k"]},
+              "required": {"type": "boolean"}
+            }
+          }
+        }
+      }
+    },
+    "params": {
+      "type": "object",
+      "additionalProperties": {"$ref": "#/$defs/param"}
+    },
+    "state": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["table", "partitions", "record_namespace", "fields"],
+      "properties": {
+        "table": {"type": "string", "minLength": 1},
+        "partitions": {"type": "integer", "minimum": 1},
+        "record_namespace": {"type": "string", "minLength": 1},
+        "fields": {
+          "type": "object",
+          "minProperties": 1,
+          "additionalProperties": {"$ref": "#/$defs/stateField"}
+        }
+      }
+    },
+    "outputs": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["kind", "topic", "direction", "producer_id", "source_protocol", "labels"],
+        "properties": {
+          "kind": {"enum": ["sustainment", "anomaly"]},
+          "topic": {"type": "string", "minLength": 1},
+          "direction": {"enum": ["local", "upward"]},
+          "producer_id": {"type": "string", "minLength": 1},
+          "source_protocol": {"type": "string", "minLength": 1},
+          "labels": {"const": "copy-source"},
+          "event_type": {"type": "string", "pattern": "^openddil\\.anomaly\\.[a-z0-9_.]+$"},
+          "severity": {"type": "string", "minLength": 1}
+        },
+        "allOf": [
+          {
+            "if": {"properties": {"kind": {"const": "anomaly"}}, "required": ["kind"]},
+            "then": {"required": ["event_type", "severity"]},
+            "else": {"not": {"anyOf": [{"required": ["event_type"]}, {"required": ["severity"]}]}}
+          }
+        ]
+      }
+    },
+    "resources": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["memory_mi", "cpu_m"],
+      "properties": {
+        "memory_mi": {"type": "number", "exclusiveMinimum": 0},
+        "cpu_m": {"type": "number", "exclusiveMinimum": 0}
+      }
+    },
+    "dependencies": {"type": "array", "maxItems": 0}
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"composition": {"const": "terminal"}}, "required": ["composition"]},
+      "then": {
+        "properties": {
+          "outputs": {"items": {"properties": {"direction": {"const": "local"}}}}
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "param": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "default"],
+      "properties": {
+        "type": {"enum": ["number", "integer"]},
+        "default": {"type": "number"},
+        "minimum": {"type": "number"},
+        "maximum": {"type": "number"},
+        "unit": {"type": "string"}
+      },
+      "if": {"properties": {"type": {"const": "integer"}}, "required": ["type"]},
+      "then": {"properties": {"default": {"type": "integer"}}}
+    },
+    "stateField": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "default"],
+      "properties": {
+        "type": {"enum": ["number", "integer"]},
+        "nullable": {"type": "boolean"},
+        "default": {"type": ["number", "null"]}
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"nullable": {"const": true}}, "required": ["nullable"]},
+          "else": {"properties": {"default": {"type": "number"}}}
+        },
+        {
+          "if": {"properties": {"type": {"const": "integer"}}, "required": ["type"]},
+          "then": {"properties": {"default": {"type": ["integer", "null"]}}}
+        }
+      ]
+    }
+  }
+}

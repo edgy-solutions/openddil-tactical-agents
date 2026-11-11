@@ -13,13 +13,7 @@ from openddil.common.v1 import quantity_pb2 as qpb
 ureg = UnitRegistry()
 ureg.default_format = "~"   # short symbol form
 
-# UCUM uses "[degF]" but pint uses "degF". Bridge the dialect.
-_UCUM_TO_PINT = {
-    "[degF]": "degF",
-    "[kn_i]": "knot",
-    "gal_us": "gallon",
-    "1": "dimensionless",
-}
+from openddil.common.v1.ucum import UCUM_TO_PINT as _UCUM_TO_PINT
 
 def from_proto(q: qpb.Quantity) -> PQ | None:
     """Convert a proto Quantity to a pint Quantity. Returns None if unset."""

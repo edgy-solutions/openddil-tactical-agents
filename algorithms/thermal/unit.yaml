@@ -1,0 +1,37 @@
+apiVersion: openddil.io/algorithm/v1
+unit: thermal
+version: "1.0.0"
+runtime: stream-parallel          # ADR-0034 execution class; the only one this runner accepts
+entrypoint: thermal.py:ThermalRunaway
+key: asset_id
+composition: propagating          # ADR-0034 composition typing
+inputs:
+  topic: raw-sensor-stream
+  roles:
+    - {role: component_temp_k, required: true}
+    - {role: ambient_temp_k, required: true}
+params:                            # every tunable constant; defaults = the original rule's values
+  delta_threshold_k:             {type: number, default: 80.0, minimum: 0, unit: K}
+  rate_threshold_k_per_sample:   {type: number, default: 2.0,  minimum: 0, unit: K}   # per sample, not per second
+  ewma_alpha:                    {type: number, default: 0.2,  minimum: 0, maximum: 1}
+state:
+  table: thermal_runaway_state
+  partitions: 1
+  record_namespace: thermal.unit._ThermalRunawayRecord
+  fields:                          # production's stored defaults, so the warm-up of the average is kept
+    last_temp_k:  {type: number, default: 0.0}
+    # The EWMA is kept for state equivalence with the original rule and is
+    # unused in the decision. Changing that is a design decision for Chris,
+    # not part of this port.
+    temp_ewma_k:  {type: number, default: 0.0}
+outputs:
+  - kind: anomaly                  # a CloudEvent on tactical-events
+    topic: tactical-events
+    direction: local               # local | upward; terminal + upward is refused
+    producer_id: thermal-derivation
+    source_protocol: openddil.thermal.v1
+    labels: copy-source            # the only accepted value until ADR-0055 (high-water)
+    event_type: openddil.anomaly.thermal.runaway.v1
+    severity: critical
+resources: {memory_mi: 8, cpu_m: 10}   # unmeasured; a ceiling for the render check, not a measurement
+dependencies: []                   # must be empty: dependencies ship in the image, never fetched
