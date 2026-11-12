@@ -1,0 +1,46 @@
+apiVersion: openddil.io/algorithm/v1
+unit: element_bands
+version: "1.0.0"
+runtime: stream-parallel          # ADR-0034 execution class; the only one this runner accepts
+entrypoint: element_bands_unit.py:ElementBands
+key: asset_id
+composition: propagating          # ADR-0034 composition typing
+inputs:
+  topic: asset-element-telemetry
+  format: json-envelope           # the element snapshot; the host gates it (object, asset id, a rollup) before the step
+  roles:
+    - {role: observed_at_s, required: true}   # observed_at_ns / 1e9; an envelope without a numeric one yields nothing
+    - {role: elements, required: true}        # (element_id, layer_name, raw element) in envelope order
+params:                            # the element health bands: the numbers the chart's elementState.healthBands held
+  bands:
+    type: bands
+    default:
+      health:
+        limits: [0.90, 0.97]       # health rises toward worse; the frontend's yellow > 0.90 and red > 0.97
+        names: [green, yellow, red]
+        hysteresis: 0.01
+        severity: {green: info, yellow: warn, red: crit}
+state:
+  persistence: memory              # lost on a restart, as the old tracker was: the first observation after it is silent
+  fields:
+    bands_by_key: {type: object, default: {}}   # {element_id: {field: band index}} for this asset
+outputs:
+  - kind: band_crossing            # the openddil.element.band CloudEvent on tactical-events
+    topic: tactical-events
+    direction: local
+    many: true                     # one per crossing, any number per envelope; an empty list sends nothing
+    stamp: none                    # the event's shape stays what it was before this unit existed
+    labels: copy-source
+resources: {memory_mi: 1, cpu_m: 1}   # the larger edge's measured peak and mean cpu, no margin; leaves out Faust and RocksDB overhead, broker client buffers and the pod's own CPU (host is not the edge node)
+measured:
+  date: "2026-11-09"
+  recording: "second lab, rev 30, t0 2026-11-08T02:12:42Z, through the 02:23Z pull"
+  basis: recorded-timing-synthetic-values
+  host: "lane 03 dev host, not the edge node; python 3.11.1"
+  records: 157689
+  assets: 9
+  rate_per_s: 1.799
+  per_sample_us: {mean: 78.2, p99: 182.5, max: 1039.3}
+  peak_python_mib: 0.158
+  state_bytes_per_asset: 2803
+dependencies: []                   # must be empty: dependencies ship in the image, never fetched

@@ -1,0 +1,45 @@
+apiVersion: openddil.io/algorithm/v1
+unit: element_rollup
+version: "1.0.0"
+runtime: stream-parallel          # ADR-0034 execution class; the only one this runner accepts
+entrypoint: element_rollup_unit.py:ElementRollup
+key: asset_id
+composition: propagating          # ADR-0034 composition typing
+inputs:
+  topic: asset-element-telemetry
+  format: json-envelope           # the element snapshot; the host gates it (object, asset id, a rollup) before the step
+  roles:
+    - {role: element_values, required: true}  # every element, unfiltered: an element with no id still counts
+    - {role: observed_at_ns}                  # int, or None when the envelope carries none
+    - {role: profile_name}
+    - {role: operational}                     # core_temp_c, uptime_hours and the condition block
+    - {role: envelope_labels}                 # (originator nation, releasable_to) as the envelope states them
+    - {role: platform_variant}
+params:                            # THREE COPIES of these two numbers: here, the frontend card's bands
+                                   # (openddil-demo TelemetryCharts), and element_bands' limits. Change all or none:
+                                   # the edge card and the region rollup must show the same counts.
+  health_critical: {type: number, default: 0.97, minimum: 0, maximum: 1, unit: "1"}   # health strictly above this is critical
+  health_degraded: {type: number, default: 0.90, minimum: 0, maximum: 1, unit: "1"}   # strictly above this (and not critical) is degraded
+state:
+  persistence: memory              # the declaration needs a state field; this one only counts envelopes
+  fields:
+    envelopes_seen: {type: integer, default: 0}
+outputs:
+  - kind: element_window           # the element path's WindowedTelemetry on the windows topic
+    topic: asset-telemetry-windows
+    direction: upward
+    stamp: none                    # the window carries no unit stamp, as before; the host supplies producer faust-edge
+    labels: copy-source
+resources: {memory_mi: 1, cpu_m: 1}   # the larger edge's measured peak and mean cpu, ceil, no margin; leaves out Faust and RocksDB overhead, broker client buffers and the pod's own CPU (host is not the edge node)
+measured:
+  date: "2026-11-10"
+  recording: "second lab, rev 30, t0 2026-11-08T02:12:42Z, through the 2026-11-11T02:37Z pull; edge-02's run (the larger mean cpu 0.648 m; edge-01: 470889 records, 9 assets, mean 209.0 us, 0.376 m, peak 0.754 MiB, 567 state bytes per asset)"
+  basis: recorded-timing-synthetic-values
+  host: "lane 03 dev host, not the edge node; python 3.11.1"
+  records: 418618
+  assets: 8
+  rate_per_s: 1.599
+  per_sample_us: {mean: 405.4, p99: 3815.9, max: 2078415.0}
+  peak_python_mib: 0.753
+  state_bytes_per_asset: 641
+dependencies: []                   # must be empty: dependencies ship in the image, never fetched

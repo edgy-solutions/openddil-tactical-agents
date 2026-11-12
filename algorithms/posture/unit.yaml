@@ -1,0 +1,61 @@
+apiVersion: openddil.io/algorithm/v1
+unit: posture
+version: "1.0.0"
+runtime: stream-parallel          # ADR-0034 execution class; the only one this runner accepts
+entrypoint: posture_unit.py:Posture
+key: asset_id
+composition: propagating          # ADR-0034 composition typing
+inputs:
+  topic: raw-sensor-stream
+  roles:
+    - {role: sample_time_s, required: true}   # the record's own provenance.sample_time, so a replay is deterministic
+    - {role: deploy_signal}                   # launcher_raised, else emitting; absent (None) when the variant states neither
+    - {role: speed_mps}                       # |ecef velocity|; absent (None) when no ecef velocity was sent
+params:                            # defaults = the old POSTURE_* env values
+  move_speed_mps: {type: number, default: 1.0, minimum: 0, unit: m/s}
+  move_hold_s:    {type: number, default: 10,  minimum: 0, unit: s}
+  stop_hold_s:    {type: number, default: 20,  minimum: 0, unit: s}
+state:
+  persistence: durable             # the asset_state table and its changelog, as before
+  table: asset_state
+  partitions: 1                    # MUST match raw-sensor-stream's partition count
+  record_namespace: faust_edge.StateRecord   # the existing changelog's records load into it unchanged
+  fields:
+    # The three thermal fields are no longer written (thermal runs as the declared
+    # unit `thermal`, with its own table). They stay in the record so the existing
+    # asset_state changelog is byte-identical; removing them is a migration of its
+    # own and needs its own decision.
+    last_temp_k:     {type: number, default: 0.0}
+    temp_ewma_k:     {type: number, default: 0.0}
+    temp_ewma_alpha: {type: number, default: 0.2}
+    posture:         {type: string, default: unspecified}
+    posture_since:   {type: number, nullable: true, default: null}
+    motion:          {type: string, default: ""}
+    motion_since:    {type: number, nullable: true, default: null}
+    signal_ever_seen: {type: boolean, default: false, persistence: memory}   # lost on a restart, as the old module-level dict was
+outputs:                           # order matters: the latest-state forward goes first, the transition after it
+  - kind: latest_state             # EntityTelemetryEvent on telemetry-latest-state: the input bytes, or with posture set
+    topic: telemetry-latest-state
+    direction: local
+    stamp: none                    # the bytes stay what they were before this unit existed
+    labels: copy-source
+  - kind: posture_transition       # the openddil.posture.transition CloudEvent on tactical-events
+    topic: tactical-events
+    direction: local
+    class: transition              # delivered only when `posture` changed
+    on_change_of: posture
+    stamp: none
+    labels: copy-source
+resources: {memory_mi: 1, cpu_m: 1}   # the larger edge's measured peak and mean cpu, no margin; leaves out Faust and RocksDB overhead, broker client buffers and the pod's own CPU (host is not the edge node)
+measured:
+  date: "2026-11-09"
+  recording: "second lab, rev 30, t0 2026-11-08T02:12:42Z, through the 02:23Z pull"
+  basis: recorded
+  host: "lane 03 dev host, not the edge node; python 3.11.1"
+  records: 157689
+  assets: 9
+  rate_per_s: 1.799
+  per_sample_us: {mean: 37.36, p99: 80.6, max: 739.3}
+  peak_python_mib: 0.115
+  state_bytes_per_asset: 204
+dependencies: []                   # must be empty: dependencies ship in the image, never fetched
