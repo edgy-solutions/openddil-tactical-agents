@@ -75,8 +75,11 @@ def make(seed: int):
         for i, el in enumerate(a.elements):
             elements.append({
                 "element_id": f"el-{i}", "layer_name": _LAYERS[i % len(_LAYERS)],
-                "health": el.step(rng),
-                "temp_c": 40.0 + rng.uniform(-5.0, 5.0), "load_pct": rng.uniform(5.0, 95.0),
+                # Emitted rounded to 9 places: rng.gauss goes through libm, whose last bit differs
+                # between platforms, and the envelope's bytes must be the same on every platform.
+                # The walk itself keeps full precision; only what is sent is rounded.
+                "health": round(el.step(rng), 9),
+                "temp_c": round(40.0 + rng.uniform(-5.0, 5.0), 9), "load_pct": round(rng.uniform(5.0, 95.0), 9),
             })
         env = {"asset_id": asset_id, "profile_name": "mrad",
                "observed_at_ns": int(ts_ms) * 1_000_000, "elements": elements}
