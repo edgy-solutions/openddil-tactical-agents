@@ -45,9 +45,12 @@ def make(seed: int):
         move = max(-5.0, min(5.0, w.target - w.delta)) * rng.uniform(0.2, 1.0)
         w.delta += move + rng.gauss(0.0, 0.3)
         th = evt.sustainment.thermal
-        th.ambient_temperature.value = w.ambient
+        # Emitted rounded to 9 places: rng.gauss goes through libm, whose last bit differs
+        # between platforms, and the event's bytes must be the same on every platform.
+        # The walk itself keeps full precision; only what is sent is rounded.
+        th.ambient_temperature.value = round(w.ambient, 9)
         th.ambient_temperature.unit = "K"
-        th.component_temperature.value = w.ambient + w.delta
+        th.component_temperature.value = round(w.ambient + w.delta, 9)
         th.component_temperature.unit = "K"
 
     return fill
