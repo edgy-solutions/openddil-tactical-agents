@@ -138,11 +138,12 @@ def test_the_synth_exercises_every_branch():
 
 
 def test_the_synth_extension_moves_nothing_the_base_synth_makes():
-    """Golden hashes of `make` over two seeds, taken before the extension."""
+    """Golden hashes of `make` over two seeds: the pre-extension `make` (e355d58) with its floats
+    emitted rounded to 9 places, the same bytes on Windows and Linux."""
     import hashlib
     from element_bands_v0 import synth as base
-    want = {1: "465b35fea1aac8434db10398ed65a6277056d271c9abb647d3665223da1fdb3b",
-            7: "66fdc16e7708b8149de5a9cdcf1977ca9089025d58bd8ab115ba62429e9de59d"}
+    want = {1: "fe2dc4797952bff36dc8bec880e6cf5e7b0506dd81212c8269fde5c8e2926e0d",
+            7: "e4692ca48a643aaa62c89d41e918dabf4560e2bb75eaad537f11131a1ed4af80"}
     for seed, digest in want.items():
         fill, h = base.make(seed), hashlib.sha256()
         for i in range(2000):

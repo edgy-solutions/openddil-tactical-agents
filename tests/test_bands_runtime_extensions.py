@@ -20,7 +20,15 @@ from algorithm_runtime.contract import Unit
 
 from unit_helpers import ROOT
 
-SCHEMA = json.loads((ROOT / "algorithms" / "declaration.schema.json").read_text(encoding="utf-8"))
+
+@pytest.fixture(autouse=True)
+def _env(monkeypatch):
+    # The runtime stamps every output with its tier; CI's runtime step sets no environment.
+    monkeypatch.setenv("OPENDDIL_EDGE_ID", "edge-test")
+    monkeypatch.delenv("OPENDDIL_REGION_ID", raising=False)
+
+
+SCHEMA =json.loads((ROOT / "algorithms" / "declaration.schema.json").read_text(encoding="utf-8"))
 
 # A self-contained copy of what the real unit declares (algorithms/element_bands/unit.yaml),
 # so these runtime tests stand without the unit.
