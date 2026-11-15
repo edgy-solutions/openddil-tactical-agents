@@ -6,6 +6,10 @@ above the edge can show element health without ever receiving the
 per-element payload.
 
 No Faust, no Kafka, no I/O.
+
+The json-envelope gate of the `element_rollup` unit (algorithms/element_rollup)
+calls `rollup_from_envelope` here; the unit's step mirrors the counting and
+the three copies of the thresholds are listed in its unit.yaml.
 """
 from __future__ import annotations
 

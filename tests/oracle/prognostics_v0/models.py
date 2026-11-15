@@ -1,3 +1,6 @@
+# FROZEN: copied from edge/prognostics at the parent commit (dec4773), test oracle only.
+# Imported by the equivalence test and the replay harness, never edited. The only
+# change from the original is the import root, prognostics -> prognostics_v0.
 """The four Phase 5 wear models (ADR-0020 initial set).
 
 Pure-Python in the fusion/rules.py mold:
@@ -27,8 +30,8 @@ from typing import Optional
 
 from openddil.telemetry.v1 import telemetry_pb2 as pb
 
-from prognostics.accumulators import AccumulatorState, observed_hours
-from prognostics.coefficients import WearCoefficients
+from prognostics_v0.accumulators import AccumulatorState, observed_hours
+from prognostics_v0.coefficients import WearCoefficients
 
 
 # ---------------------------------------------------------------------------

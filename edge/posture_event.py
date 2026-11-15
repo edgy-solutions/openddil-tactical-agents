@@ -26,11 +26,19 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime, timezone
-from typing import Optional, Sequence
-
-from posture import PostureState
+from typing import Optional, Protocol, Sequence
 
 EVENT_TYPE = "openddil.posture.transition"
+
+
+class PostureState(Protocol):
+    """What this module reads of a posture state: attributes only. The state
+    machine itself lives in the posture unit; any object with these four
+    attributes (a NamedTuple, a SimpleNamespace) will do."""
+    posture: str
+    posture_since: Optional[float]
+    motion: str
+    motion_since: Optional[float]
 
 
 def _rfc3339(t: float) -> str:

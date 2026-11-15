@@ -1,3 +1,6 @@
+# FROZEN: copied from edge/prognostics at the parent commit (dec4773), test oracle only.
+# Imported by the equivalence test and the replay harness, never edited. The only
+# change from the original is the import root, prognostics -> prognostics_v0.
 """Authored placeholder coefficients for the Phase 5 prognostics engine.
 
 THESE ARE NOT CALIBRATED — they are authored placeholders. Per ADR-0020,

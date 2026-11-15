@@ -16,7 +16,7 @@ RUN pip install --no-cache-dir \
     # runtime 6.x or newer. Same fix as openddil-cm-service/pyproject.toml.
     "protobuf>=6.30.0,<7.0.0"
 
-# Bake the edge agent code (faust_edge.py + detection/ + prognostics/ + ...).
+# Bake the edge agent code (faust_edge.py + detection/ + algorithm_runtime/ + ...).
 # Without this COPY the image is deps-only and the ENTRYPOINT below points at
 # a /app/faust_edge.py that does not exist — the docker-compose dev override
 # bind-mounts the code, which is why the gap stayed hidden until a Helm

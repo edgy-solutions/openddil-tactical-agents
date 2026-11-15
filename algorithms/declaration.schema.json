@@ -1,0 +1,268 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://openddil.io/algorithm/v1/declaration.schema.json",
+  "title": "Algorithm unit declaration, openddil.io/algorithm/v1",
+  "description": "Mirrors edge/algorithm_runtime/declaration.py. Two rules are not expressible here, and the runtime validator enforces them: a param default must lie within its own minimum/maximum, a bands default's limits must ascend with one more distinct name than limits and a severity for each name (the validator checks them), and a transition output's on_change_of must name a declared state field, and a measured.date must be a real calendar date (the pattern checks only the shape). `measured` is optional: a unit without one loads, and the runner refuses to start it. An object or boolean state field is allowed only under persistence: memory (the unit's or its own); a durable unit needs at least one durable field; a memory unit has no table, partitions or record_namespace.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["apiVersion", "unit", "version", "runtime", "entrypoint", "key", "composition", "inputs", "params", "state", "outputs", "resources"],
+  "properties": {
+    "apiVersion": {"const": "openddil.io/algorithm/v1"},
+    "unit": {"type": "string", "pattern": "^[a-z][a-z0-9_]*$"},
+    "version": {"type": "string", "minLength": 1},
+    "runtime": {"const": "stream-parallel"},
+    "entrypoint": {"type": "string", "pattern": "^[^:]+:[^:]+$"},
+    "key": {"const": "asset_id"},
+    "composition": {"enum": ["propagating", "terminal"]},
+    "inputs": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["topic", "roles"],
+      "properties": {
+        "topic": {"type": "string", "minLength": 1},
+        "format": {"enum": ["protobuf", "json-envelope"]},
+        "roles": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["role"],
+            "properties": {
+              "role": {"enum": ["position_ecef_m", "pitch_deg", "roll_deg", "sample_time_ns", "component_temp_k", "ambient_temp_k", "record_time_ns", "fuel_remaining", "consumables", "wear_hours", "wear_rul", "active_fault_codes", "deploy_signal", "speed_mps", "sample_time_s", "observed_at_s", "elements", "element_values", "observed_at_ns", "profile_name", "operational", "envelope_labels", "platform_variant"]},
+              "required": {"type": "boolean"}
+            }
+          }
+        }
+      }
+    },
+    "params": {
+      "type": "object",
+      "additionalProperties": {"$ref": "#/$defs/param"}
+    },
+    "state": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["fields"],
+      "properties": {
+        "persistence": {"enum": ["durable", "memory"]},
+        "table": {"type": "string", "minLength": 1},
+        "partitions": {"type": "integer", "minimum": 1},
+        "record_namespace": {"type": "string", "minLength": 1},
+        "fields": {
+          "type": "object",
+          "minProperties": 1,
+          "additionalProperties": {"$ref": "#/$defs/stateField"}
+        }
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"persistence": {"const": "memory"}}, "required": ["persistence"]},
+          "then": {
+            "not": {"anyOf": [{"required": ["table"]}, {"required": ["partitions"]}, {"required": ["record_namespace"]}]},
+            "properties": {"fields": {"additionalProperties": {"properties": {"persistence": {"const": "memory"}}}}}
+          },
+          "else": {
+            "required": ["table", "partitions", "record_namespace"],
+            "properties": {"fields": {
+              "additionalProperties": {
+                "if": {"properties": {"type": {"enum": ["number", "integer", "string"]}}, "required": ["type"]},
+                "else": {"required": ["persistence"], "properties": {"persistence": {"const": "memory"}}}
+              },
+              "not": {"additionalProperties": {"required": ["persistence"], "properties": {"persistence": {"const": "memory"}}}}
+            }}
+          }
+        }
+      ]
+    },
+    "outputs": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["kind", "topic", "direction", "labels"],
+        "properties": {
+          "kind": {"enum": ["sustainment", "anomaly", "window", "latest_state", "posture_transition", "band_crossing", "element_window"]},
+          "many": {"type": "boolean"},
+          "class": {"enum": ["value", "transition"]},
+          "on_change_of": {"type": "string", "minLength": 1},
+          "stamp": {"enum": ["producer", "none"]},
+          "topic": {"type": "string", "minLength": 1},
+          "direction": {"enum": ["local", "upward"]},
+          "producer_id": {"type": "string", "minLength": 1},
+          "source_protocol": {"type": "string", "minLength": 1},
+          "labels": {"const": "copy-source"},
+          "event_type": {"type": "string", "pattern": "^openddil\\.anomaly\\.[a-z0-9_.]+$"},
+          "severity": {"type": "string", "minLength": 1}
+        },
+        "allOf": [
+          {
+            "if": {"properties": {"kind": {"const": "anomaly"}}, "required": ["kind"]},
+            "then": {"required": ["event_type", "severity"]},
+            "else": {"not": {"anyOf": [{"required": ["event_type"]}, {"required": ["severity"]}]}}
+          },
+          {
+            "if": {"properties": {"kind": {"enum": ["latest_state", "posture_transition", "band_crossing", "element_window"]}}, "required": ["kind"]},
+            "then": {
+              "required": ["stamp"],
+              "properties": {"stamp": {"const": "none"}},
+              "not": {"anyOf": [{"required": ["producer_id"]}, {"required": ["source_protocol"]}]}
+            },
+            "else": {
+              "required": ["producer_id", "source_protocol"],
+              "not": {"required": ["stamp"], "properties": {"stamp": {"const": "none"}}}
+            }
+          },
+          {
+            "if": {"properties": {"class": {"const": "transition"}}, "required": ["class"]},
+            "then": {"required": ["on_change_of"]},
+            "else": {"not": {"required": ["on_change_of"]}}
+          }
+        ]
+      }
+    },
+    "resources": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["memory_mi", "cpu_m"],
+      "properties": {
+        "memory_mi": {"type": "number", "exclusiveMinimum": 0},
+        "cpu_m": {"type": "number", "exclusiveMinimum": 0}
+      }
+    },
+    "measured": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["date", "recording", "basis", "host", "records", "assets", "rate_per_s", "per_sample_us", "peak_python_mib", "state_bytes_per_asset"],
+      "properties": {
+        "date": {"type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$"},
+        "recording": {"type": "string", "minLength": 1},
+        "basis": {"enum": ["recorded", "recorded-timing-synthetic-values"]},
+        "host": {"type": "string", "minLength": 1},
+        "records": {"type": "integer", "minimum": 0},
+        "assets": {"type": "integer", "minimum": 0},
+        "rate_per_s": {"type": "number", "minimum": 0},
+        "per_sample_us": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["mean", "p99", "max"],
+          "properties": {
+            "mean": {"type": "number", "minimum": 0},
+            "p99": {"type": "number", "minimum": 0},
+            "max": {"type": "number", "minimum": 0}
+          }
+        },
+        "peak_python_mib": {"type": "number", "minimum": 0},
+        "state_bytes_per_asset": {"type": "integer", "minimum": 0}
+      }
+    },
+    "dependencies": {"type": "array", "maxItems": 0}
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"composition": {"const": "terminal"}}, "required": ["composition"]},
+      "then": {
+        "properties": {
+          "outputs": {"items": {"properties": {"direction": {"const": "local"}}}}
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "param": {
+      "oneOf": [{"$ref": "#/$defs/numericParam"}, {"$ref": "#/$defs/bandsParam"}]
+    },
+    "bandsParam": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "default"],
+      "properties": {
+        "type": {"const": "bands"},
+        "default": {
+          "type": "object",
+          "minProperties": 1,
+          "additionalProperties": {
+            "type": "object",
+            "required": ["limits", "names", "hysteresis", "severity"],
+            "properties": {
+              "limits": {"type": "array", "minItems": 1, "items": {"type": "number"}},
+              "names": {"type": "array", "minItems": 2, "items": {"type": "string", "minLength": 1}},
+              "hysteresis": {"type": "number", "minimum": 0},
+              "severity": {"type": "object", "additionalProperties": {"type": "string", "minLength": 1}}
+            }
+          }
+        }
+      }
+    },
+    "numericParam": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "default"],
+      "properties": {
+        "type": {"enum": ["number", "integer"]},
+        "default": {"type": "number"},
+        "minimum": {"type": "number"},
+        "maximum": {"type": "number"},
+        "unit": {"type": "string"}
+      },
+      "if": {"properties": {"type": {"const": "integer"}}, "required": ["type"]},
+      "then": {"properties": {"default": {"type": "integer"}}}
+    },
+    "stateField": {
+      "oneOf": [{"$ref": "#/$defs/numericStateField"}, {"$ref": "#/$defs/objectStateField"},
+                {"$ref": "#/$defs/stringStateField"}, {"$ref": "#/$defs/booleanStateField"}]
+    },
+    "stringStateField": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "default"],
+      "properties": {
+        "type": {"const": "string"},
+        "persistence": {"enum": ["durable", "memory"]},
+        "default": {"type": "string"}
+      }
+    },
+    "booleanStateField": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "default"],
+      "properties": {
+        "type": {"const": "boolean"},
+        "persistence": {"enum": ["durable", "memory"]},
+        "default": {"type": "boolean"}
+      }
+    },
+    "objectStateField": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "default"],
+      "properties": {
+        "type": {"const": "object"},
+        "persistence": {"enum": ["durable", "memory"]},
+        "default": {"type": "object"}
+      }
+    },
+    "numericStateField": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "default"],
+      "properties": {
+        "type": {"enum": ["number", "integer"]},
+        "nullable": {"type": "boolean"},
+        "persistence": {"enum": ["durable", "memory"]},
+        "default": {"type": ["number", "null"]}
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"nullable": {"const": true}}, "required": ["nullable"]},
+          "else": {"properties": {"default": {"type": "number"}}}
+        },
+        {
+          "if": {"properties": {"type": {"const": "integer"}}, "required": ["type"]},
+          "then": {"properties": {"default": {"type": ["integer", "null"]}}}
+        }
+      ]
+    }
+  }
+}

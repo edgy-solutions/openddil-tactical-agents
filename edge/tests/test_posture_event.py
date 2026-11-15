@@ -1,25 +1,24 @@
 """
 Tests for the posture transition event (edge/posture_event.py) and its
-emission from the faust_edge `process` agent. No broker: the agent's
-underlying coroutine is driven with a fake stream and fake topics.
+emission from the posture unit. No broker: the unit is driven through the
+runner's Wiring, as the agent drives it.
 
 Run with: py -3 -m pytest edge/tests/test_posture_event.py -q
 (contracts gen/python on PYTHONPATH)
 """
 from __future__ import annotations
 
-import asyncio
-import json
 import sys
-from collections import defaultdict
 from pathlib import Path
 
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-import posture as posture_mod  # noqa: E402
-from posture import PostureState  # noqa: E402
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "algorithms" / "posture"))
+
+import posture_unit as posture_mod  # noqa: E402
+from posture_unit import PostureState  # noqa: E402
 from posture_event import build_transition_event  # noqa: E402
 
 EMPLACED = PostureState("emplaced", 0.0, "stationary", 0.0)
@@ -83,10 +82,14 @@ def test_unchanged_posture_raises():
         _ev(new=PostureState("march_ordered", None, "", None))
 
 
-# Wiring: drive the real `process` agent body with fake topics.
-def test_one_send_per_transition():
-    import faust_edge
+# Wiring: drive the real unit through the runner's per-record path.
+def test_one_send_per_transition(monkeypatch):
+    import importlib.util
+
+    from algorithm_runtime import declaration, guard, runner
     from openddil.telemetry.v1 import telemetry_pb2 as pb
+
+    monkeypatch.setenv("OPENDDIL_EDGE_ID", "edge-test")
 
     def mk(t, *, launcher, speed):
         e = pb.EntityTelemetryEvent()
@@ -108,31 +111,19 @@ def test_one_send_per_transition():
         (60, True, 0.0),    # raise -> emplaced
     ]
 
-    class Fake:
-        def __init__(self):
-            self.sent = []
+    unit_dir = Path(__file__).resolve().parents[2] / "algorithms" / "posture"
+    decl = declaration.load(unit_dir / "unit.yaml")
+    guard.check_unit_dir(unit_dir)
+    spec = importlib.util.spec_from_file_location("openddil_algorithms.posture", unit_dir / "posture_unit.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    wiring = runner.Wiring(module.Posture(declaration.resolve_params(decl, None)), decl, lambda _a: None, {})
 
-        async def send(self, key=None, value=None, **kw):
-            self.sent.append((key, value))
+    sent, state = [], None
+    for t, l, s in seq:
+        state, sends = wiring.process(mk(t, launcher=l, speed=s), 0, state)
+        sent += [msg for topic, _key, msg in sends if topic == "tactical-events"]
 
-    ev_t, st_t, win_t = Fake(), Fake(), Fake()
-
-    async def stream():
-        for t, l, s in seq:
-            yield mk(t, launcher=l, speed=s)
-
-    mp = pytest.MonkeyPatch()
-    try:
-        mp.setattr(faust_edge, "events_topic", ev_t)
-        mp.setattr(faust_edge, "state_topic", st_t)
-        mp.setattr(faust_edge, "windows_topic", win_t)
-        mp.setattr(faust_edge, "asset_state", defaultdict(faust_edge.StateRecord))
-        mp.setattr(faust_edge, "REGISTERED", [])
-        asyncio.run(faust_edge.process.fun(stream()))
-    finally:
-        mp.undo()
-
-    sent = [json.loads(v) for _, v in ev_t.sent]
     tr = [e for e in sent if e["type"] == "openddil.posture.transition"]
     # first tick is unspecified -> emplaced, then four more transitions
     tos = [e["data"]["to"] for e in tr]

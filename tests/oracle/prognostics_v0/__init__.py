@@ -1,3 +1,6 @@
+# FROZEN: copied from edge/prognostics at the parent commit (dec4773), test oracle only.
+# Imported by the equivalence test and the replay harness, never edited. The only
+# change from the original is the import root, prognostics -> prognostics_v0.
 """OpenDDIL Phase 5 — Prognostics Derivation Engine (see ADR-0020).
 
 `register(app)` is the one-line seam: faust_edge.py imports it and calls
@@ -12,6 +15,6 @@ what this engine claims (pipeline works end-to-end) and what it does not
 (numbers are accurate). Validation against measured ground truth is the
 deferred AFSIM or co-located-simulator phase.
 """
-from prognostics.agent import register  # noqa: F401
+from prognostics_v0.agent import register  # noqa: F401
 
 __all__ = ["register"]

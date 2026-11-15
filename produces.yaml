@@ -11,6 +11,7 @@ workloads:
       - derived-sustainment
       - "${FAUST_APP_ID:-openddil-edge}-asset_state-changelog"
       - "${FAUST_APP_ID:-openddil-edge}-prognostics_accumulators-changelog"
+      - "${FAUST_APP_ID:-openddil-edge}-thermal_runaway_state-changelog"
   faust-regional:
     image: openddil/faust-regional
     topics:

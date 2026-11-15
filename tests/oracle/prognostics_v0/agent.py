@@ -1,3 +1,6 @@
+# FROZEN: copied from edge/prognostics at the parent commit (dec4773), test oracle only.
+# Imported by the equivalence test and the replay harness, never edited. The only
+# change from the original is the import root, prognostics -> prognostics_v0.
 """Phase 5 prognostics engine — Faust wiring layer.
 
 **This is the ONLY file in the `prognostics/` package that imports Faust.**
@@ -33,9 +36,9 @@ import uuid
 import faust
 from openddil.telemetry.v1 import telemetry_pb2 as pb
 
-from prognostics.accumulators import AccumulatorState, observe_kinematic
-from prognostics.coefficients import WearCoefficients
-from prognostics.models import derive_sustainment
+from prognostics_v0.accumulators import AccumulatorState, observe_kinematic
+from prognostics_v0.coefficients import WearCoefficients
+from prognostics_v0.models import derive_sustainment
 
 log = logging.getLogger("prognostics")
 
