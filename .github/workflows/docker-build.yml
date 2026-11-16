@@ -4,7 +4,7 @@ on:
   push:
     branches: [ "master" ]
     # Tag pushes (v1.0.0, ...) publish versioned images (:v1.0.0)
-    # alongside :latest so consumers can pin to a release.
+    # so consumers can pin to a release. A tag does not move :latest.
     tags: [ "v*" ]
   pull_request:
     branches: [ "master" ]
@@ -14,12 +14,23 @@ permissions:
   contents: read
   packages: write
 
-# All images publish under ghcr.io/edgy-solutions/openddil/<service>:latest
-# AND additionally under :<tag-name> on a v* tag push.
+# All images publish under ghcr.io/edgy-solutions/openddil/<service>.
+#
+# Tags, on every image:
+#   :sha-<7>  every build, from the commit it built. On a pull request that is
+#             the branch head, not GitHub's merge commit, so the tag names a
+#             commit that exists on the branch.
+#   :pr-<N>   a pull request build.
+#   :<tag>    a v* tag push.
+#   :latest   a push or a dispatch on master, and nothing else. A branch, a
+#             pull request or a tag never moves it.
+# A pull request from a fork builds but pushes nothing: its token cannot write
+# packages.
+#
 # `${{ github.repository_owner }}` resolves to `edgy-solutions` for this repo.
 # The openddil-demo base compose references each of these images directly.
-# A pull request builds every image and publishes none: :latest moves only on
-# a push to master, so an unmerged branch never reaches a cluster that pulls it.
+# A pull request publishes its :sha-<7> and :pr-<N> images, never :latest, so
+# an unmerged branch reaches a cluster only when it is pinned by its sha.
 
 jobs:
   # The Hero-scenario edge agent referenced by openddil-demo/docker-compose.yml
@@ -30,6 +41,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v3
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v2
@@ -41,13 +54,24 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # :sha-<7> always, :pr-<N> on a pull request, :<tag> on a v* tag;
+      # :latest only from master.
       - name: Compute image tags
         id: tags
+        env:
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
           REG=ghcr.io/${{ github.repository_owner }}/openddil/faust-edge
-          T="$REG:latest"
-          if [ "${{ github.ref_type }}" = "tag" ]; then
-            T="$T,$REG:${{ github.ref_name }}"
+          T="$REG:sha-${HEAD_SHA:0:7}"
+          if [ -n "$PR_NUMBER" ]; then
+            T="$T,$REG:pr-$PR_NUMBER"
+          fi
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            T="$T,$REG:$GITHUB_REF_NAME"
+          fi
+          if [ "$GITHUB_REF" = "refs/heads/master" ] && [ "$GITHUB_EVENT_NAME" != "pull_request" ]; then
+            T="$T,$REG:latest"
           fi
           echo "tags=$T" >> "$GITHUB_OUTPUT"
 
@@ -56,7 +80,7 @@ jobs:
         with:
           context: ./edge
           file: ./edge/Dockerfile
-          push: ${{ github.event_name != 'pull_request' }}
+          push: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
           tags: ${{ steps.tags.outputs.tags }}
 
   # Legacy Faust detector (separate codepath from the Hero faust_edge agent
@@ -67,6 +91,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v3
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v2
@@ -78,13 +104,24 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # :sha-<7> always, :pr-<N> on a pull request, :<tag> on a v* tag;
+      # :latest only from master.
       - name: Compute image tags
         id: tags
+        env:
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
           REG=ghcr.io/${{ github.repository_owner }}/openddil/edge-faust-detector
-          T="$REG:latest"
-          if [ "${{ github.ref_type }}" = "tag" ]; then
-            T="$T,$REG:${{ github.ref_name }}"
+          T="$REG:sha-${HEAD_SHA:0:7}"
+          if [ -n "$PR_NUMBER" ]; then
+            T="$T,$REG:pr-$PR_NUMBER"
+          fi
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            T="$T,$REG:$GITHUB_REF_NAME"
+          fi
+          if [ "$GITHUB_REF" = "refs/heads/master" ] && [ "$GITHUB_EVENT_NAME" != "pull_request" ]; then
+            T="$T,$REG:latest"
           fi
           echo "tags=$T" >> "$GITHUB_OUTPUT"
 
@@ -93,7 +130,7 @@ jobs:
         with:
           context: .
           file: ./edge/faust/Dockerfile
-          push: ${{ github.event_name != 'pull_request' }}
+          push: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
           tags: ${{ steps.tags.outputs.tags }}
           target: production
 
@@ -103,6 +140,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v3
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v2
@@ -114,13 +153,24 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # :sha-<7> always, :pr-<N> on a pull request, :<tag> on a v* tag;
+      # :latest only from master.
       - name: Compute image tags
         id: tags
+        env:
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
           REG=ghcr.io/${{ github.repository_owner }}/openddil/edge-restate-detector
-          T="$REG:latest"
-          if [ "${{ github.ref_type }}" = "tag" ]; then
-            T="$T,$REG:${{ github.ref_name }}"
+          T="$REG:sha-${HEAD_SHA:0:7}"
+          if [ -n "$PR_NUMBER" ]; then
+            T="$T,$REG:pr-$PR_NUMBER"
+          fi
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            T="$T,$REG:$GITHUB_REF_NAME"
+          fi
+          if [ "$GITHUB_REF" = "refs/heads/master" ] && [ "$GITHUB_EVENT_NAME" != "pull_request" ]; then
+            T="$T,$REG:latest"
           fi
           echo "tags=$T" >> "$GITHUB_OUTPUT"
 
@@ -129,7 +179,7 @@ jobs:
         with:
           context: .
           file: ./edge/restate/Dockerfile
-          push: ${{ github.event_name != 'pull_request' }}
+          push: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
           tags: ${{ steps.tags.outputs.tags }}
           target: production
 
@@ -140,6 +190,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v3
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v2
@@ -151,13 +203,24 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # :sha-<7> always, :pr-<N> on a pull request, :<tag> on a v* tag;
+      # :latest only from master.
       - name: Compute image tags
         id: tags
+        env:
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
           REG=ghcr.io/${{ github.repository_owner }}/openddil/hub-restate-projector
-          T="$REG:latest"
-          if [ "${{ github.ref_type }}" = "tag" ]; then
-            T="$T,$REG:${{ github.ref_name }}"
+          T="$REG:sha-${HEAD_SHA:0:7}"
+          if [ -n "$PR_NUMBER" ]; then
+            T="$T,$REG:pr-$PR_NUMBER"
+          fi
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            T="$T,$REG:$GITHUB_REF_NAME"
+          fi
+          if [ "$GITHUB_REF" = "refs/heads/master" ] && [ "$GITHUB_EVENT_NAME" != "pull_request" ]; then
+            T="$T,$REG:latest"
           fi
           echo "tags=$T" >> "$GITHUB_OUTPUT"
 
@@ -166,7 +229,7 @@ jobs:
         with:
           context: .
           file: ./hub/projector/Dockerfile
-          push: ${{ github.event_name != 'pull_request' }}
+          push: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
           tags: ${{ steps.tags.outputs.tags }}
           target: production
 
@@ -182,6 +245,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v3
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v2
@@ -193,13 +258,24 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # :sha-<7> always, :pr-<N> on a pull request, :<tag> on a v* tag;
+      # :latest only from master.
       - name: Compute image tags
         id: tags
+        env:
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
           REG=ghcr.io/${{ github.repository_owner }}/openddil/faust-regional
-          T="$REG:latest"
-          if [ "${{ github.ref_type }}" = "tag" ]; then
-            T="$T,$REG:${{ github.ref_name }}"
+          T="$REG:sha-${HEAD_SHA:0:7}"
+          if [ -n "$PR_NUMBER" ]; then
+            T="$T,$REG:pr-$PR_NUMBER"
+          fi
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            T="$T,$REG:$GITHUB_REF_NAME"
+          fi
+          if [ "$GITHUB_REF" = "refs/heads/master" ] && [ "$GITHUB_EVENT_NAME" != "pull_request" ]; then
+            T="$T,$REG:latest"
           fi
           echo "tags=$T" >> "$GITHUB_OUTPUT"
 
@@ -208,5 +284,5 @@ jobs:
         with:
           context: ./regional
           file: ./regional/Dockerfile
-          push: ${{ github.event_name != 'pull_request' }}
+          push: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
           tags: ${{ steps.tags.outputs.tags }}
