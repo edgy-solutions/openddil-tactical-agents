@@ -3,9 +3,8 @@ name: Docker Build
 on:
   push:
     branches: [ "master" ]
-    # Tag pushes (v1.0.0, ...) publish versioned images (:v1.0.0)
-    # so consumers can pin to a release. A tag does not move :latest.
-    tags: [ "v*" ]
+    # Version tags don't build here. A release adds the version tag to an
+    # image already built (see release.yml) and never moves :latest.
   pull_request:
     branches: [ "master" ]
   workflow_dispatch:
@@ -21,7 +20,7 @@ permissions:
 #             the branch head, not GitHub's merge commit, so the tag names a
 #             commit that exists on the branch.
 #   :pr-<N>   a pull request build.
-#   :<tag>    a v* tag push.
+#   :<tag>    not built here: a release adds it (release.yml).
 #   :latest   a push or a dispatch on master, and nothing else. A branch, a
 #             pull request or a tag never moves it.
 # A pull request from a fork builds but pushes nothing: its token cannot write
