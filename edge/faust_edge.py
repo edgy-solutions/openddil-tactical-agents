@@ -16,8 +16,10 @@ DEPLOYMENT NOTE:
 - Development: Uses `docker-compose.override.yml` to build from source and
                mount local code for hot-reloading.
 """
+import contextlib
 import logging
 import os
+import sys
 
 import faust
 from openddil.telemetry.v1 import telemetry_pb2 as pb
@@ -62,7 +64,32 @@ windows_topic = app.topic("asset-telemetry-windows", value_type=bytes)
 # asset's last trends payload and last element rollup, so nothing windowed
 # lives here.
 
-algorithm_runner = register_algorithms(app)
+@contextlib.contextmanager
+def _registration_logging():
+    """Show the runner's INFO registration lines at module load.
+
+    Faust configures logging only at worker start, after this module has run,
+    so until then INFO is dropped. Attach a handler to the runner's logger for
+    the registration call only, then restore both handler and level so faust's
+    own setup is unaffected. Propagation is left alone.
+    """
+    lg = logging.getLogger("algorithm_runtime")
+    handler = logging.StreamHandler(sys.stderr)
+    handler.setLevel(logging.INFO)
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s"))
+    prior_level = lg.level
+    lg.addHandler(handler)
+    if lg.getEffectiveLevel() > logging.INFO:
+        lg.setLevel(logging.INFO)
+    try:
+        yield
+    finally:
+        lg.removeHandler(handler)
+        lg.setLevel(prior_level)
+
+
+with _registration_logging():
+    algorithm_runner = register_algorithms(app)
 
 if __name__ == "__main__":
     app.main()
